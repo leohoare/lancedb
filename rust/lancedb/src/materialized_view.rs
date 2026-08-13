@@ -19,6 +19,7 @@
 //! indexes, search -- works on it unchanged. Writes are not blocked, but a
 //! refresh that rebuilds replaces them; the definition is the source of truth.
 
+pub mod refresh;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -36,6 +37,8 @@ use crate::table::Table;
 use crate::table::refresh::quote_identifier;
 use crate::table::{ColumnDefinition, ColumnKind};
 use crate::{Error, Result};
+
+pub use refresh::{RefreshMaterializedViewResult, RefreshMode};
 
 /// Schema metadata key holding the view definition, as kind-tagged JSON.
 pub const DEFINITION_META_KEY: &str = "mv.definition";
@@ -967,6 +970,60 @@ impl MaterializedView {
     pub fn definition(&self) -> &MaterializedViewDefinition {
         &self.definition
     }
+
+    /// Recompute the view from its source.
+    ///
+    /// By default the refresh is incremental when the source only gained rows
+    /// since the last one, and otherwise rebuilds; see
+    /// [`RefreshMaterializedViewBuilder`].
+    ///
+    /// ```no_run
+    /// # #![recursion_limit = "256"]
+    /// # use lancedb::materialized_view::MaterializedView;
+    /// # async fn refresh(view: &MaterializedView) -> Result<(), Box<dyn std::error::Error>> {
+    /// let result = view.refresh().execute().await?;
+    /// println!("{:?}: {} rows", result.mode, result.rows_written);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn refresh(&self) -> RefreshMaterializedViewBuilder {
+        RefreshMaterializedViewBuilder {
+            view: self.clone(),
+            full: false,
+            source_version: None,
+        }
+    }
+}
+
+/// Builds a refresh. Created by [`MaterializedView::refresh`].
+pub struct RefreshMaterializedViewBuilder {
+    view: MaterializedView,
+    full: bool,
+    source_version: Option<u64>,
+}
+
+impl RefreshMaterializedViewBuilder {
+    /// Rebuild the view even where an incremental refresh would do.
+    pub fn full(mut self, full: bool) -> Self {
+        self.full = full;
+        self
+    }
+
+    /// Refresh to this source table version instead of the latest.
+    pub fn source_version(mut self, version: u64) -> Self {
+        self.source_version = Some(version);
+        self
+    }
+
+    pub async fn execute(self) -> Result<RefreshMaterializedViewResult> {
+        refresh::execute_refresh(
+            &self.view.table,
+            &self.view.definition,
+            self.full,
+            self.source_version,
+        )
+        .await
+    }
 }
 
 impl Connection {
@@ -976,6 +1033,7 @@ impl Connection {
     /// metadata; refresh computes the rows. Local databases only.
     ///
     /// ```no_run
+    /// # #![recursion_limit = "256"]
     /// # use lancedb::Connection;
     /// # async fn create(conn: &Connection) -> Result<(), Box<dyn std::error::Error>> {
     /// let view = conn
@@ -984,7 +1042,7 @@ impl Connection {
     ///     .only_if("age >= 18")
     ///     .execute()
     ///     .await?;
-    /// println!("{}", view.definition().source_table);
+    /// view.refresh().execute().await?;
     /// # Ok(())
     /// # }
     /// ```
