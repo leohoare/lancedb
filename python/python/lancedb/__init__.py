@@ -21,6 +21,11 @@ from .remote.db import RemoteDBConnection
 from .expr import Expr, col, lit, func
 from .schema import blob, vector, BlobType
 from .job import AsyncJob, Job
+from .materialized_view import (
+    AsyncMaterializedView,
+    MaterializedView,
+    MaterializedViewDefinition,
+)
 from .table import AsyncTable, Table
 from .types import BaseTokenizerType
 from ._lancedb import Session
@@ -495,6 +500,9 @@ async def connect_async(
 
 
 __all__ = [
+    "AsyncMaterializedView",
+    "MaterializedView",
+    "MaterializedViewDefinition",
     "connect",
     "connect_async",
     "tokenize",
