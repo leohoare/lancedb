@@ -267,6 +267,48 @@ impl Connection {
     }
 
     #[napi(catch_unwind)]
+    pub async fn create_materialized_view(
+        &self,
+        name: String,
+        source: String,
+        projections: Option<Vec<Vec<String>>>,
+        filter: Option<String>,
+        limit: Option<i64>,
+    ) -> napi::Result<Table> {
+        let mut builder = self.get_inner()?.create_materialized_view(name, source);
+        if let Some(projections) = projections {
+            let mut pairs = Vec::with_capacity(projections.len());
+            for pair in projections {
+                let [output, expression]: [String; 2] = pair.try_into().map_err(|_| {
+                    napi::Error::from_reason(
+                        "each projection must be an [output, expression] pair",
+                    )
+                })?;
+                pairs.push((output, expression));
+            }
+            builder = builder.select(pairs);
+        }
+        if let Some(filter) = filter {
+            builder = builder.only_if(filter);
+        }
+        if let Some(limit) = limit {
+            builder = builder.limit(limit as u64);
+        }
+        let view = builder.execute().await.default_error()?;
+        Ok(Table::new(view.table().clone()))
+    }
+
+    #[napi(catch_unwind)]
+    pub async fn list_materialized_views(&self) -> napi::Result<Vec<String>> {
+        let views = self
+            .get_inner()?
+            .list_materialized_views()
+            .await
+            .default_error()?;
+        Ok(views.iter().map(|v| v.name().to_string()).collect())
+    }
+
+    #[napi(catch_unwind)]
     pub async fn open_table(
         &self,
         name: String,

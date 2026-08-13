@@ -34,6 +34,7 @@ import {
   Branches as NativeBranches,
   OptimizeStats,
   RefreshColumnResult,
+  RefreshMaterializedViewResult,
   TableStatistics,
   Tags,
   UpdateFieldMetadataResult,
@@ -594,6 +595,18 @@ export abstract class Table {
    * ```
    */
   abstract refreshColumnAsync(column: string): Promise<Job>;
+
+  /**
+   * Recompute this table's contents from its materialized-view definition.
+   *
+   * Plumbing for {@link MaterializedView.refresh}, which is the way to call
+   * it: rejects tables that carry no view definition. Local tables only.
+   * @ignore
+   */
+  abstract refreshMaterializedView(
+    full?: boolean,
+    sourceVersion?: number,
+  ): Promise<RefreshMaterializedViewResult>;
 
   /**
    * Alter the name or nullability of columns.
@@ -1202,6 +1215,13 @@ export class LocalTable extends Table {
 
   async refreshColumnAsync(column: string): Promise<Job> {
     return await this.inner.refreshColumnAsync(column);
+  }
+
+  async refreshMaterializedView(
+    full?: boolean,
+    sourceVersion?: number,
+  ): Promise<RefreshMaterializedViewResult> {
+    return await this.inner.refreshMaterializedView(full, sourceVersion);
   }
 
   async alterColumns(
