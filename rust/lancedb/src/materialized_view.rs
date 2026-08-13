@@ -20,6 +20,10 @@
 //! refresh that rebuilds replaces them; the definition is the source of truth.
 
 pub mod refresh;
+
+#[cfg(test)]
+mod differential;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
