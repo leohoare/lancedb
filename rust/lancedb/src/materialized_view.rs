@@ -28,8 +28,9 @@ use lance_datafusion::planner::Planner;
 use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
+use crate::database::listing::OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS;
+use crate::table::Table;
 use crate::table::refresh::quote_identifier;
-use crate::table::{Table, WriteOptions};
 use crate::{Error, Result};
 
 /// Schema metadata key holding the view definition, as kind-tagged JSON.
@@ -463,16 +464,14 @@ impl CreateMaterializedViewBuilder {
             definition_to_metadata(&definition)?,
         )]);
         let schema = Arc::new(ArrowSchema::new_with_metadata(fields, metadata));
-        // Stable row ids so the view can itself source another view.
+        // Stable row ids so the view can itself source another view. The
+        // request-level option outranks any connection-level override; the
+        // manifest is still verified because another Database impl may
+        // ignore the option, but nothing is rolled back on failure.
         let table = self
             .connection
             .create_empty_table(&self.name, schema)
-            .write_options(WriteOptions {
-                lance_write_params: Some(lance::dataset::WriteParams {
-                    enable_stable_row_ids: true,
-                    ..Default::default()
-                }),
-            })
+            .storage_option(OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS, "true")
             .execute()
             .await?;
         let stable = match table.as_native() {
@@ -480,13 +479,11 @@ impl CreateMaterializedViewBuilder {
             None => false,
         };
         if !stable {
-            let _ = self.connection.drop_table(&self.name, &[]).await;
-            return Err(Error::InvalidInput {
+            return Err(Error::Runtime {
                 message: format!(
-                    "view '{}' would be created without stable row ids: the \
-                     connection's new_table_enable_stable_row_ids setting \
-                     overrides view creation; remove it or use a connection \
-                     without it",
+                    "view '{}' was created without stable row ids: the database \
+                     ignored the creation option; the table remains and is not \
+                     usable as a materialized view",
                     self.name
                 ),
             });
@@ -882,42 +879,41 @@ mod tests {
         assert_eq!(definition.filter.as_deref(), Some("age >= 18"));
     }
 
-    /// A connection override that would create the view without stable row
-    /// ids fails loudly instead of committing an unchainable view.
+    /// The creation option outranks a connection configured to create
+    /// unstable tables: the view still gets stable row ids, on the same
+    /// store (no fork -- the table must be reachable through the
+    /// connection afterwards).
     #[tokio::test]
-    async fn test_conflicting_connection_override_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
-        let uri = dir.path().to_str().unwrap();
-        let stable_conn = connect(uri).execute().await.unwrap();
-        let batch = record_batch!(("x", Int32, [1])).unwrap();
-        stable_conn
-            .create_table("src", batch)
-            .write_options(stable_row_ids())
-            .execute()
-            .await
-            .unwrap();
-
-        let unstable_conn = connect(uri)
+    async fn test_view_is_stable_despite_connection_override() {
+        let conn = connect("memory://")
             .storage_options([("new_table_enable_stable_row_ids", "false")])
             .execute()
             .await
             .unwrap();
-        let err = unstable_conn
+        let batch = record_batch!(("x", Int32, [1])).unwrap();
+        conn.create_table("src", batch)
+            .storage_option("new_table_enable_stable_row_ids", "true")
+            .execute()
+            .await
+            .unwrap();
+
+        let view = conn
             .create_materialized_view("v", "src")
             .execute()
             .await
-            .unwrap_err();
-        assert!(
-            matches!(err, Error::InvalidInput { message } if message.contains("stable row ids"))
-        );
-        assert!(
-            !unstable_conn
-                .table_names()
-                .execute()
-                .await
-                .unwrap()
-                .contains(&"v".to_string())
-        );
+            .unwrap();
+        let stable = view
+            .table()
+            .as_native()
+            .unwrap()
+            .dataset
+            .get()
+            .await
+            .unwrap()
+            .manifest
+            .uses_stable_row_ids();
+        assert!(stable);
+        conn.open_materialized_view("v").await.unwrap();
     }
 
     /// A committed filter has to be usable as a predicate.

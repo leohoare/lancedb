@@ -819,6 +819,33 @@ impl ListingDatabase {
             .clone()
             .unwrap_or_default();
 
+        // The new-table keys are creation configuration, not store options:
+        // strip them so a request carrying only them keeps the connection's
+        // store instead of forking a new one.
+        if let Some(store_params) = write_params.store_params.as_mut() {
+            let mut options = store_params.storage_options().cloned().unwrap_or_default();
+            for key in [
+                OPT_NEW_TABLE_STORAGE_VERSION,
+                OPT_NEW_TABLE_V2_MANIFEST_PATHS,
+                OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS,
+            ] {
+                options.remove(key);
+            }
+            let provider = store_params
+                .storage_options_accessor
+                .as_ref()
+                .and_then(|accessor| accessor.provider().cloned());
+            store_params.storage_options_accessor = match (options.is_empty(), provider) {
+                (true, None) => None,
+                (_, Some(provider)) => Some(Arc::new(
+                    StorageOptionsAccessor::with_initial_and_provider(options, provider),
+                )),
+                (false, None) => Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                    options,
+                ))),
+            };
+        }
+
         // Only modify the storage options if we actually have something to
         // inherit. There is a difference between storage_options=None and
         // storage_options=Some({}). Using storage_options=None will cause the
