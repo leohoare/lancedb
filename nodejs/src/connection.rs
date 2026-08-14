@@ -280,9 +280,7 @@ impl Connection {
             let mut pairs = Vec::with_capacity(projections.len());
             for pair in projections {
                 let [output, expression]: [String; 2] = pair.try_into().map_err(|_| {
-                    napi::Error::from_reason(
-                        "each projection must be an [output, expression] pair",
-                    )
+                    napi::Error::from_reason("each projection must be an [output, expression] pair")
                 })?;
                 pairs.push((output, expression));
             }
@@ -292,7 +290,9 @@ impl Connection {
             builder = builder.only_if(filter);
         }
         if let Some(limit) = limit {
-            builder = builder.limit(limit as u64);
+            let limit = u64::try_from(limit)
+                .map_err(|_| napi::Error::from_reason("limit must be a non-negative integer"))?;
+            builder = builder.limit(limit);
         }
         let view = builder.execute().await.default_error()?;
         Ok(Table::new(view.table().clone()))
@@ -305,7 +305,7 @@ impl Connection {
             .list_materialized_views()
             .await
             .default_error()?;
-        Ok(views.iter().map(|v| v.name().to_string()).collect())
+        Ok(views.into_iter().map(|v| v.name).collect())
     }
 
     #[napi(catch_unwind)]

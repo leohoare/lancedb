@@ -87,6 +87,29 @@ describe("materialized views", () => {
     ).rejects.toThrow("missing");
   });
 
+  it("rejects negative numeric options before creating anything", async () => {
+    await expect(
+      db.createMaterializedView("bad", "people", { limit: -5 }),
+    ).rejects.toThrow("non-negative");
+    expect(await db.listMaterializedViews()).toEqual([]);
+
+    const view = await db.createMaterializedView("copy", "people");
+    await expect(view.refresh({ sourceVersion: -1 })).rejects.toThrow(
+      "non-negative",
+    );
+  });
+
+  it("quotes bare select names", async () => {
+    await db.createTable("odd_names", [{ "order item": "widget" }], {
+      storageOptions: { newTableEnableStableRowIds: "true" },
+    });
+    const view = await db.createMaterializedView("quoted", "odd_names", {
+      select: ["order item"],
+    });
+    const result = await view.refresh();
+    expect(Number(result.rowsWritten)).toBe(1);
+  });
+
   it("requires stable row ids on the source", async () => {
     await db.createTable("plain", [{ x: 1 }]);
     await expect(db.createMaterializedView("v", "plain")).rejects.toThrow(

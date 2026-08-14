@@ -29,7 +29,17 @@ export type MaterializedViewSelect =
   | (string | [string, string])[]
   | Record<string, string>;
 
-/** @internal Normalize a select argument into `[alias, expression]` pairs. */
+/** @internal Quote a column name as a Lance SQL identifier (backticks). */
+function quoteIdentifier(name: string): string {
+  return "`" + name.replace(/`/g, "``") + "`";
+}
+
+/**
+ * @internal Normalize a select argument into `[alias, expression]` pairs.
+ * A bare name projects itself and is quoted, so any valid column name works;
+ * pair and record entries are kept verbatim because their right side is an
+ * expression.
+ */
 export function normalizeSelect(
   select?: MaterializedViewSelect,
 ): [string, string][] | undefined {
@@ -38,7 +48,7 @@ export function normalizeSelect(
   }
   if (Array.isArray(select)) {
     return select.map((item) =>
-      typeof item === "string" ? [item, item] : item,
+      typeof item === "string" ? [item, quoteIdentifier(item)] : item,
     );
   }
   return Object.entries(select);

@@ -392,7 +392,10 @@ impl Table {
             .default_error()?;
         let mut builder = view.refresh().full(full.unwrap_or(false));
         if let Some(version) = source_version {
-            builder = builder.source_version(version as u64);
+            let version = u64::try_from(version).map_err(|_| {
+                napi::Error::from_reason("sourceVersion must be a non-negative integer")
+            })?;
+            builder = builder.source_version(version);
         }
         let result = builder.execute().await.default_error()?;
         Ok(result.into())
