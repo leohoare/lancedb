@@ -87,16 +87,20 @@ describe("materialized views", () => {
     ).rejects.toThrow("missing");
   });
 
-  it("rejects negative numeric options before creating anything", async () => {
-    await expect(
-      db.createMaterializedView("bad", "people", { limit: -5 }),
-    ).rejects.toThrow("non-negative");
+  it("rejects invalid numeric options before creating anything", async () => {
+    for (const limit of [-5, 1.5, Infinity, NaN]) {
+      await expect(
+        db.createMaterializedView("bad", "people", { limit }),
+      ).rejects.toThrow("non-negative integer");
+    }
     expect(await db.listMaterializedViews()).toEqual([]);
 
     const view = await db.createMaterializedView("copy", "people");
-    await expect(view.refresh({ sourceVersion: -1 })).rejects.toThrow(
-      "non-negative",
-    );
+    for (const sourceVersion of [-1, 1.5, Infinity, NaN]) {
+      await expect(view.refresh({ sourceVersion })).rejects.toThrow(
+        "non-negative integer",
+      );
+    }
   });
 
   it("quotes bare select names", async () => {

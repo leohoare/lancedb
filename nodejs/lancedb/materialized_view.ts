@@ -29,6 +29,19 @@ export type MaterializedViewSelect =
   | (string | [string, string])[]
   | Record<string, string>;
 
+/**
+ * @internal Reject a numeric option N-API would otherwise silently coerce:
+ * `Infinity` reaches Rust as 0, `1.5` as 1.
+ */
+export function validateNonNegativeInteger(
+  value: number | undefined,
+  name: string,
+): void {
+  if (value !== undefined && !(Number.isSafeInteger(value) && value >= 0)) {
+    throw new Error(`${name} must be a non-negative integer`);
+  }
+}
+
 /** @internal Quote a column name as a Lance SQL identifier (backticks). */
 function quoteIdentifier(name: string): string {
   return "`" + name.replace(/`/g, "``") + "`";
@@ -125,6 +138,7 @@ export class MaterializedView {
     full?: boolean;
     sourceVersion?: number;
   }): Promise<RefreshMaterializedViewResult> {
+    validateNonNegativeInteger(options?.sourceVersion, "sourceVersion");
     return await this.inner.refreshMaterializedView(
       options?.full,
       options?.sourceVersion,

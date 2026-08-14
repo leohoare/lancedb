@@ -20,6 +20,7 @@ import {
   MaterializedView,
   MaterializedViewSelect,
   normalizeSelect,
+  validateNonNegativeInteger,
 } from "./materialized_view";
 import { Connection as LanceDbConnection } from "./native";
 import type {
@@ -580,6 +581,7 @@ export class LocalConnection extends Connection {
       limit?: number;
     },
   ): Promise<MaterializedView> {
+    validateNonNegativeInteger(options?.limit, "limit");
     const innerTable = await this.inner.createMaterializedView(
       name,
       source,
