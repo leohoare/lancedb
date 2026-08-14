@@ -30,7 +30,9 @@ use crate::table::{CompactionOptions, OptimizeAction, Table};
 /// One source mutation, one per correctness-relevant class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SrcOp {
-    /// Fresh 100-spaced ids: the only op that should refresh incrementally.
+    /// Fresh non-colliding ids of both parities, so every other op has
+    /// view-resident rows to act on: the only op that should refresh
+    /// incrementally.
     AppendNew,
     /// Deletion in surviving fragments must break the pure-append check.
     DeleteEven,
@@ -129,8 +131,10 @@ impl Case {
     async fn apply(&mut self, op: SrcOp) {
         match op {
             SrcOp::AppendNew => {
-                let ids: Vec<i32> = (0..3).map(|i| self.next_id + i * 100).collect();
-                self.next_id += 300;
+                // Mixed parity: the middle id is odd, so UpdateOddScore always
+                // has a filter-matching appended row to evict.
+                let ids = vec![self.next_id, self.next_id + 101, self.next_id + 202];
+                self.next_id += 303;
                 self.source.add(rows_batch(&ids)).execute().await.unwrap();
             }
             SrcOp::DeleteEven => {
@@ -361,11 +365,21 @@ async fn differential_named_regressions() {
     assert_eq!(result.rows_written, 3);
     case.check("compact then append").await.unwrap();
 
-    // A row updated to no longer match the filter must leave the view.
+    // A row updated to no longer match the filter must leave the view --
+    // and the fixture must prove the eviction happened, not merely that the
+    // end state matches: an update that never touched a view-resident row
+    // would also "match".
     let mut case = Case::new(Shape::Filtered).await;
     case.apply(SrcOp::AppendNew).await;
     case.view.refresh().execute().await.unwrap();
+    let before = case.view_rows().await.len();
     case.apply(SrcOp::UpdateOddScore).await;
     case.view.refresh().execute().await.unwrap();
+    let after = case.view_rows().await.len();
+    assert!(
+        after < before,
+        "no view-resident row was evicted ({before} -> {after}); the fixture \
+         no longer exercises the filtered-update transition"
+    );
     case.check("update crosses the filter").await.unwrap();
 }
