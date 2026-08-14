@@ -151,7 +151,48 @@ pub(crate) async fn execute_refresh(
     let source_version = source_ds.version().version;
     let source_ts = source_ds.manifest.timestamp_nanos;
 
+    // Re-plan the persisted definition against the current source schema and
+    // require its planned output to be exactly the view's physical schema: a
+    // definition the stored table cannot represent must not be certified.
+    let source_schema = Arc::new(ArrowSchema::from(source_ds.schema()));
+    let projections: Vec<(String, String)> = definition
+        .projections
+        .iter()
+        .map(|p| (p.output.clone(), p.expression.clone()))
+        .collect();
     validate_inputs(&source_ds, definition)?;
+    let (replanned, mut planned_fields) = super::plan(
+        source_schema,
+        &definition.source_table,
+        &projections,
+        definition.filter.as_deref(),
+        definition.limit,
+    )?;
+    planned_fields.push(arrow_schema::Field::new(
+        SOURCE_ROW_ID_COLUMN,
+        arrow_schema::DataType::UInt64,
+        false,
+    ));
+    let physical = ArrowSchema::from(view_ds.schema());
+    let planned_shape: Vec<_> = planned_fields
+        .iter()
+        .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
+        .collect();
+    let physical_shape: Vec<_> = physical
+        .fields()
+        .iter()
+        .map(|f| (f.name().clone(), f.data_type().clone(), f.is_nullable()))
+        .collect();
+    if planned_shape != physical_shape {
+        return Err(Error::Schema {
+            message: format!(
+                "the stored definition of view '{}' does not produce this \
+                 view's schema; recreate the view",
+                view.name()
+            ),
+        });
+    }
+    let definition = &replanned;
 
     let metadata = &view_ds.schema().metadata;
     let watermark: Option<u64> = metadata
@@ -1420,6 +1461,40 @@ mod tests {
         let result = view.refresh().execute().await.unwrap();
         assert_eq!(result.mode, RefreshMode::Rebuild);
         assert_eq!(read(view.table(), "twice").await, vec![3, 6]);
+    }
+
+    /// A persisted definition that does not produce this view's schema must
+    /// not refresh at all, let alone be certified.
+    #[tokio::test]
+    async fn test_definition_view_schema_mismatch_is_refused() {
+        let (conn, _) = db_with_source(vec![1, 2]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        let narrower = crate::materialized_view::MaterializedViewDefinition {
+            source_table: "src".into(),
+            projections: vec![crate::materialized_view::ViewProjection {
+                output: "x".into(),
+                expression: "x".into(),
+            }],
+            filter: None,
+            limit: None,
+            inputs: vec!["x".into()],
+        };
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::materialized_view::DEFINITION_META_KEY.to_string(),
+            crate::materialized_view::definition_to_metadata(&narrower).unwrap(),
+        );
+        view.table()
+            .as_native()
+            .unwrap()
+            .replace_schema_metadata(metadata)
+            .await
+            .unwrap();
+
+        let err = view.refresh().execute().await.unwrap_err();
+        assert!(matches!(err, Error::Schema { message } if message.contains("does not produce")),);
     }
 
     /// An output whose name needs quoting flows through as a projection
