@@ -285,16 +285,19 @@ fn ensure_immutable(expr: &datafusion_expr::Expr, error: impl Fn(String) -> Erro
     use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion_expr::Volatility;
 
-    // Labeled immutable but actually build-dependent: version() returns the
-    // DataFusion build string, so its value changes across upgrades.
-    const BUILD_DEPENDENT: &[&str] = &["version"];
+    // Labeled immutable but not determined by row values alone: version()
+    // depends on the build, and the arrow_* introspectors on schema state
+    // (name, type, nullability, field metadata) that may change without any
+    // data change a refresh could observe.
+    const NOT_VALUE_DETERMINED: &[&str] =
+        &["version", "arrow_typeof", "arrow_field", "arrow_metadata"];
 
     let mut offending: Option<String> = None;
     expr.apply(|node| {
         if let datafusion_expr::Expr::ScalarFunction(function) = node {
             let name = function.func.name();
             if function.func.signature().volatility != Volatility::Immutable
-                || BUILD_DEPENDENT.contains(&name)
+                || NOT_VALUE_DETERMINED.contains(&name)
             {
                 offending = Some(name.to_string());
                 return Ok(TreeNodeRecursion::Stop);
@@ -1021,7 +1024,13 @@ mod tests {
     #[tokio::test]
     async fn test_volatile_and_unstable_expressions_are_rejected() {
         let conn = people_db().await;
-        for expression in ["random()", "now()", "version()"] {
+        for expression in [
+            "random()",
+            "now()",
+            "version()",
+            "arrow_typeof(age)",
+            "arrow_metadata(age, 'k')",
+        ] {
             let err = conn
                 .create_materialized_view("bad", "people")
                 .select([("x", expression)])
