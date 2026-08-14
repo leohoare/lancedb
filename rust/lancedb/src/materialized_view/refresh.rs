@@ -116,8 +116,11 @@ pub(crate) async fn execute_refresh(
     view_native.dataset.ensure_mutable()?;
     let lock = refresh_lock(view_native.dataset.get().await?.uri());
     let _guard = lock.lock().await;
-    // Snapshot the view under the lock, so a concurrent refresh's commits
-    // are either fully visible here or fully ordered after this one.
+    // Force-load the latest view state under the lock: each handle caches
+    // lazily, and a second handle would otherwise plan from a snapshot taken
+    // before another handle's commit -- appending the same rows again or
+    // reporting NoOp over a mutated view.
+    view_native.dataset.reload().await?;
     let view_ds = view_native.dataset.get().await?.as_ref().clone();
 
     let source_ds = open_source(view, definition).await?;
@@ -551,12 +554,18 @@ async fn rebuild(
         .metadata
         .get(VIEW_VERSION_META_KEY)
         .and_then(|raw| raw.parse().ok());
-    let version = if recorded == Some(version) {
-        view_native.dataset.update(new_dataset);
-        version
-    } else {
-        stamp_watermark(view_native, new_dataset, source_version, source_ts).await?
-    };
+    if recorded != Some(version) {
+        // A commit raced between planning and the overwrite; the stamped
+        // generation is wrong and must not be certified. The data landed,
+        // the record did not: the next refresh rebuilds.
+        return Err(Error::Runtime {
+            message: format!(
+                "a concurrent commit raced this refresh (view version {version}); \
+                 the refresh is unrecorded and the next one will rebuild"
+            ),
+        });
+    }
+    view_native.dataset.update(new_dataset);
     Ok(RefreshMaterializedViewResult {
         mode: RefreshMode::Rebuild,
         rows_written: rows_written.load(Ordering::Relaxed),
@@ -620,45 +629,49 @@ async fn replace_retaining_indices(
 }
 
 /// Record that the view now reflects `source_version`, including the view
-/// version this very commit produces (predicted, then verified, so a racing
-/// commit cannot leave the record pointing at someone else's version), and
-/// hand the updated dataset to the table handle. Returns the view version.
+/// version this very commit produces. The version is predicted and then
+/// verified; on a mismatch another commit raced in between, and the stamp
+/// ABORTS rather than certify that commit as the refresh's own generation.
+/// The view is left visibly unstamped, so the next refresh rebuilds.
 async fn stamp_watermark(
     view_native: &NativeTable,
     mut dataset: Dataset,
     source_version: u64,
     source_ts: u128,
 ) -> Result<u64> {
-    for _ in 0..3 {
-        let predicted = dataset.version().version + 1;
-        dataset
-            .update_schema_metadata([
-                (
-                    SOURCE_VERSION_META_KEY.to_string(),
-                    Some(source_version.to_string()),
-                ),
-                (
-                    SOURCE_VERSION_TS_META_KEY.to_string(),
-                    Some(source_ts.to_string()),
-                ),
-                (
-                    REFRESHED_AT_MS_META_KEY.to_string(),
-                    Some(now_ms().to_string()),
-                ),
-                (
-                    VIEW_VERSION_META_KEY.to_string(),
-                    Some(predicted.to_string()),
-                ),
-            ])
-            .await?;
-        if dataset.version().version == predicted {
-            view_native.dataset.update(dataset);
-            return Ok(predicted);
-        }
+    let predicted = dataset.version().version + 1;
+    dataset
+        .update_schema_metadata([
+            (
+                SOURCE_VERSION_META_KEY.to_string(),
+                Some(source_version.to_string()),
+            ),
+            (
+                SOURCE_VERSION_TS_META_KEY.to_string(),
+                Some(source_ts.to_string()),
+            ),
+            (
+                REFRESHED_AT_MS_META_KEY.to_string(),
+                Some(now_ms().to_string()),
+            ),
+            (
+                VIEW_VERSION_META_KEY.to_string(),
+                Some(predicted.to_string()),
+            ),
+        ])
+        .await?;
+    let actual = dataset.version().version;
+    if actual != predicted {
+        return Err(Error::Runtime {
+            message: format!(
+                "a concurrent commit raced this refresh (view version {actual}, \
+                 expected {predicted}); the refresh is unrecorded and the next \
+                 one will rebuild"
+            ),
+        });
     }
-    Err(Error::Runtime {
-        message: "concurrent writes kept moving the view while recording its refresh".into(),
-    })
+    view_native.dataset.update(dataset);
+    Ok(predicted)
 }
 
 fn now_ms() -> u128 {
@@ -1285,6 +1298,45 @@ mod tests {
         let modes = [a.mode, b.mode];
         assert!(modes.contains(&RefreshMode::Incremental));
         assert!(modes.contains(&RefreshMode::NoOp));
+    }
+
+    /// A second handle's lazy cache must not defeat the lock: after another
+    /// handle's refresh commits, the stale handle plans from the reloaded
+    /// state and no-ops instead of appending the same fragments again.
+    #[tokio::test]
+    async fn test_a_second_handle_does_not_double_append() {
+        let (conn, source) = db_with_source(vec![1, 2, 3]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+        let stale = conn.open_materialized_view("doubled").await.unwrap();
+
+        append(&source, vec![4]).await;
+        view.refresh().execute().await.unwrap();
+
+        let result = stale.refresh().execute().await.unwrap();
+        assert_eq!(result.mode, RefreshMode::NoOp);
+        assert_eq!(read(view.table(), "twice").await, vec![2, 4, 6, 8]);
+    }
+
+    /// A commit racing between a refresh's data commit and its stamp must
+    /// not be certified as the refresh's generation: the stamp aborts, and
+    /// the next refresh rebuilds from the drifted state.
+    #[tokio::test]
+    async fn test_stamp_aborts_on_a_racing_commit() {
+        let (conn, _) = db_with_source(vec![1, 2]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        let view_native = view.table().as_native().unwrap();
+        let stale = view_native.dataset.get().await.unwrap().as_ref().clone();
+        view.table().delete("x = 1").await.unwrap();
+
+        let err = stamp_watermark(view_native, stale, 99, 99).await;
+        assert!(err.is_err());
+
+        let result = view.refresh().execute().await.unwrap();
+        assert_eq!(result.mode, RefreshMode::Rebuild);
+        assert_eq!(read(view.table(), "twice").await, vec![2, 4]);
     }
 
     /// An output whose name needs quoting flows through as a projection
