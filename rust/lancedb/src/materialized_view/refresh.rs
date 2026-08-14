@@ -22,13 +22,14 @@
 //! behind the data; the next incremental refresh would then re-append rows it
 //! already holds.
 //!
-//! Refreshes of one view do not serialize against each other: two incremental
-//! refreshes planned at the same watermark each append the same rows, since
-//! appends do not conflict. Run one refresh of a view at a time.
+//! Refreshes of one view are serialized within a process by a per-view lock.
+//! Across processes nothing serializes them, and two incremental refreshes
+//! planned at the same watermark would each append the same rows; run one
+//! process's refreshes against a view at a time.
 
-use std::collections::HashSet;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use arrow_array::RecordBatch;
@@ -79,6 +80,29 @@ pub struct RefreshMaterializedViewResult {
     pub version: u64,
 }
 
+/// Schema metadata key holding the view table version a successful refresh
+/// left behind. Any other commit on the view is drift, and refresh rebuilds.
+pub const VIEW_VERSION_META_KEY: &str = "mv.view_version";
+
+/// Schema metadata key holding the commit timestamp of the watermark's source
+/// manifest. A dropped and recreated source reuses version numbers but never
+/// their timestamps, so a mismatch means the watermark describes a different
+/// incarnation and refresh rebuilds.
+pub const SOURCE_VERSION_TS_META_KEY: &str = "mv.source_version_ts";
+
+/// One refresh per view at a time within this process.
+fn refresh_lock(uri: &str) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: OnceLock<StdMutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
+        OnceLock::new();
+    LOCKS
+        .get_or_init(Default::default)
+        .lock()
+        .expect("refresh lock registry poisoned")
+        .entry(uri.to_string())
+        .or_default()
+        .clone()
+}
+
 /// Internal implementation of the refresh logic.
 pub(crate) async fn execute_refresh(
     view: &Table,
@@ -90,6 +114,10 @@ pub(crate) async fn execute_refresh(
         message: "materialized views are supported only on local tables".into(),
     })?;
     view_native.dataset.ensure_mutable()?;
+    let lock = refresh_lock(view_native.dataset.get().await?.uri());
+    let _guard = lock.lock().await;
+    // Snapshot the view under the lock, so a concurrent refresh's commits
+    // are either fully visible here or fully ordered after this one.
     let view_ds = view_native.dataset.get().await?.as_ref().clone();
 
     let source_ds = open_source(view, definition).await?;
@@ -98,16 +126,25 @@ pub(crate) async fn execute_refresh(
         None => source_ds,
     };
     let source_version = source_ds.version().version;
+    let source_ts = source_ds.manifest.timestamp_nanos;
 
     validate_inputs(&source_ds, definition)?;
 
-    let watermark: Option<u64> = view_ds
-        .schema()
-        .metadata
+    let metadata = &view_ds.schema().metadata;
+    let watermark: Option<u64> = metadata
         .get(SOURCE_VERSION_META_KEY)
         .and_then(|raw| raw.parse().ok());
+    let recorded_ts: Option<u128> = metadata
+        .get(SOURCE_VERSION_TS_META_KEY)
+        .and_then(|raw| raw.parse().ok());
+    // The watermark speaks only for the view state its refresh left behind;
+    // any other commit on the view since then is drift.
+    let view_intact = metadata
+        .get(VIEW_VERSION_META_KEY)
+        .and_then(|raw| raw.parse::<u64>().ok())
+        == Some(view_ds.version().version);
 
-    if !full && watermark == Some(source_version) {
+    if !full && watermark == Some(source_version) && view_intact && recorded_ts == Some(source_ts) {
         return Ok(RefreshMaterializedViewResult {
             mode: RefreshMode::NoOp,
             rows_written: 0,
@@ -116,13 +153,24 @@ pub(crate) async fn execute_refresh(
         });
     }
 
-    match plan_increment(&source_ds, source_version, watermark, full, definition).await {
+    let watermark = watermark.filter(|_| view_intact);
+    match plan_increment(
+        &source_ds,
+        source_version,
+        watermark,
+        recorded_ts,
+        full,
+        definition,
+    )
+    .await
+    {
         Some(new_fragments) => {
             incremental(
                 view_native,
                 &view_ds,
                 &source_ds,
                 source_version,
+                source_ts,
                 new_fragments,
                 definition,
             )
@@ -134,6 +182,7 @@ pub(crate) async fn execute_refresh(
                 &view_ds,
                 &source_ds,
                 source_version,
+                source_ts,
                 definition,
             )
             .await
@@ -157,6 +206,7 @@ async fn plan_increment(
     source_ds: &Dataset,
     source_version: u64,
     watermark: Option<u64>,
+    recorded_ts: Option<u128>,
     full: bool,
     definition: &MaterializedViewDefinition,
 ) -> Option<Vec<Fragment>> {
@@ -168,6 +218,11 @@ async fn plan_increment(
         return None;
     }
     let old = source_ds.checkout_version(watermark).await.ok()?;
+    // A recreated source reuses version numbers, never their timestamps: a
+    // mismatch means the watermark describes a different incarnation.
+    if recorded_ts != Some(old.manifest.timestamp_nanos) {
+        return None;
+    }
     let old_ids: HashSet<u64> = old.get_fragments().iter().map(|f| f.id() as u64).collect();
     let live: Vec<Fragment> = source_ds
         .get_fragments()
@@ -352,11 +407,13 @@ async fn open_source(view: &Table, definition: &MaterializedViewDefinition) -> R
     Ok(dataset)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn incremental(
     view_native: &NativeTable,
     view_ds: &Dataset,
     source_ds: &Dataset,
     source_version: u64,
+    source_ts: u128,
     new_fragments: Vec<Fragment>,
     definition: &MaterializedViewDefinition,
 ) -> Result<RefreshMaterializedViewResult> {
@@ -376,7 +433,8 @@ async fn incremental(
         version: view_ds.version().version,
     };
     if new_fragments.is_empty() || remaining == Some(0) {
-        result.version = stamp_watermark(view_native, view_ds.clone(), source_version).await?;
+        result.version =
+            stamp_watermark(view_native, view_ds.clone(), source_version, source_ts).await?;
         return Ok(result);
     }
 
@@ -397,7 +455,8 @@ async fn incremental(
     // Nothing survived the filter: the watermark still has to advance or the
     // same fragments would be rescanned forever.
     let Some(first) = stream.try_next().await? else {
-        result.version = stamp_watermark(view_native, view_ds.clone(), source_version).await?;
+        result.version =
+            stamp_watermark(view_native, view_ds.clone(), source_version, source_ts).await?;
         return Ok(result);
     };
     let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -413,7 +472,7 @@ async fn incremental(
         .execute_stream(stream)
         .await?;
     result.rows_written = rows_written.load(Ordering::Relaxed);
-    result.version = stamp_watermark(view_native, appended, source_version).await?;
+    result.version = stamp_watermark(view_native, appended, source_version, source_ts).await?;
     Ok(result)
 }
 
@@ -422,6 +481,7 @@ async fn rebuild(
     view_ds: &Dataset,
     source_ds: &Dataset,
     source_version: u64,
+    source_ts: u128,
     definition: &MaterializedViewDefinition,
 ) -> Result<RefreshMaterializedViewResult> {
     let indexed = !view_ds.load_indices().await?.is_empty();
@@ -441,7 +501,7 @@ async fn rebuild(
         let replaced = replace_retaining_indices(view_ds.clone(), stream).await?;
         // The swap keeps the previous schema metadata, watermark included, so
         // it is restamped in a follow-up commit.
-        let version = stamp_watermark(view_native, replaced, source_version).await?;
+        let version = stamp_watermark(view_native, replaced, source_version, source_ts).await?;
         return Ok(RefreshMaterializedViewResult {
             mode: RefreshMode::Rebuild,
             rows_written: rows_written.load(Ordering::Relaxed),
@@ -456,7 +516,15 @@ async fn rebuild(
             SOURCE_VERSION_META_KEY.to_string(),
             source_version.to_string(),
         );
+        metadata.insert(
+            SOURCE_VERSION_TS_META_KEY.to_string(),
+            source_ts.to_string(),
+        );
         metadata.insert(REFRESHED_AT_MS_META_KEY.to_string(), now_ms().to_string());
+        // The overwrite is the refresh's final commit when nothing races it;
+        // the stamped view version is verified below and re-stamped if not.
+        let predicted = view_ds.version().version + 1;
+        metadata.insert(VIEW_VERSION_META_KEY.to_string(), predicted.to_string());
         let schema = Arc::new(ArrowSchema::from(view_ds.schema()).with_metadata(metadata));
         let stream = compute_stream(
             source_ds,
@@ -478,7 +546,17 @@ async fn rebuild(
     };
 
     let version = new_dataset.version().version;
-    view_native.dataset.update(new_dataset);
+    let recorded: Option<u64> = new_dataset
+        .schema()
+        .metadata
+        .get(VIEW_VERSION_META_KEY)
+        .and_then(|raw| raw.parse().ok());
+    let version = if recorded == Some(version) {
+        view_native.dataset.update(new_dataset);
+        version
+    } else {
+        stamp_watermark(view_native, new_dataset, source_version, source_ts).await?
+    };
     Ok(RefreshMaterializedViewResult {
         mode: RefreshMode::Rebuild,
         rows_written: rows_written.load(Ordering::Relaxed),
@@ -541,28 +619,46 @@ async fn replace_retaining_indices(
         .await?)
 }
 
-/// Record that the view now reflects `source_version`, and hand the updated
-/// dataset to the table handle. Returns the view version.
+/// Record that the view now reflects `source_version`, including the view
+/// version this very commit produces (predicted, then verified, so a racing
+/// commit cannot leave the record pointing at someone else's version), and
+/// hand the updated dataset to the table handle. Returns the view version.
 async fn stamp_watermark(
     view_native: &NativeTable,
     mut dataset: Dataset,
     source_version: u64,
+    source_ts: u128,
 ) -> Result<u64> {
-    dataset
-        .update_schema_metadata([
-            (
-                SOURCE_VERSION_META_KEY.to_string(),
-                Some(source_version.to_string()),
-            ),
-            (
-                REFRESHED_AT_MS_META_KEY.to_string(),
-                Some(now_ms().to_string()),
-            ),
-        ])
-        .await?;
-    let version = dataset.version().version;
-    view_native.dataset.update(dataset);
-    Ok(version)
+    for _ in 0..3 {
+        let predicted = dataset.version().version + 1;
+        dataset
+            .update_schema_metadata([
+                (
+                    SOURCE_VERSION_META_KEY.to_string(),
+                    Some(source_version.to_string()),
+                ),
+                (
+                    SOURCE_VERSION_TS_META_KEY.to_string(),
+                    Some(source_ts.to_string()),
+                ),
+                (
+                    REFRESHED_AT_MS_META_KEY.to_string(),
+                    Some(now_ms().to_string()),
+                ),
+                (
+                    VIEW_VERSION_META_KEY.to_string(),
+                    Some(predicted.to_string()),
+                ),
+            ])
+            .await?;
+        if dataset.version().version == predicted {
+            view_native.dataset.update(dataset);
+            return Ok(predicted);
+        }
+    }
+    Err(Error::Runtime {
+        message: "concurrent writes kept moving the view while recording its refresh".into(),
+    })
 }
 
 fn now_ms() -> u128 {
@@ -1132,6 +1228,63 @@ mod tests {
         let result = second.refresh().execute().await.unwrap();
         assert_eq!(result.mode, RefreshMode::Incremental);
         assert_eq!(read(second.table(), "twice").await, vec![60, 100]);
+    }
+
+    /// The watermark speaks only for the state a refresh left behind: a
+    /// direct write to the view is drift, and the next refresh rebuilds
+    /// rather than preserving it as current.
+    #[tokio::test]
+    async fn test_direct_view_mutation_forces_a_rebuild() {
+        let (conn, _) = db_with_source(vec![1, 2]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        view.table().delete("x = 1").await.unwrap();
+        let result = view.refresh().execute().await.unwrap();
+        assert_eq!(result.mode, RefreshMode::Rebuild);
+        assert_eq!(read(view.table(), "twice").await, vec![2, 4]);
+        assert_eq!(
+            view.refresh().execute().await.unwrap().mode,
+            RefreshMode::NoOp
+        );
+    }
+
+    /// A dropped and recreated source reuses version numbers but never their
+    /// timestamps; the watermark must not vouch for the replacement's rows.
+    #[tokio::test]
+    async fn test_source_recreation_forces_a_rebuild() {
+        let (conn, _) = db_with_source(vec![1]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        conn.drop_table("src", &[]).await.unwrap();
+        let batch = record_batch!(("x", Int32, [7])).unwrap();
+        conn.create_table("src", batch)
+            .write_options(crate::materialized_view::tests::stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        let result = view.refresh().execute().await.unwrap();
+        assert_eq!(result.mode, RefreshMode::Rebuild);
+        assert_eq!(read(view.table(), "twice").await, vec![14]);
+    }
+
+    /// In-process refreshes of one view serialize: the loser of the race
+    /// observes the winner's watermark instead of appending the same rows.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_concurrent_refreshes_do_not_duplicate() {
+        let (conn, source) = db_with_source(vec![1]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        append(&source, vec![2, 3]).await;
+        let (a, b) = tokio::join!(view.refresh().execute(), view.refresh().execute());
+        let (a, b) = (a.unwrap(), b.unwrap());
+        assert_eq!(read(view.table(), "twice").await, vec![2, 4, 6]);
+        let modes = [a.mode, b.mode];
+        assert!(modes.contains(&RefreshMode::Incremental));
+        assert!(modes.contains(&RefreshMode::NoOp));
     }
 
     /// An output whose name needs quoting flows through as a projection
