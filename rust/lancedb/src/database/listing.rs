@@ -819,39 +819,8 @@ impl ListingDatabase {
             .clone()
             .unwrap_or_default();
 
-        // The new-table keys are creation configuration, not store options:
-        // strip them so a request carrying only them keeps the connection's
-        // store instead of forking a new one. An accessor that carried none
-        // of them is left alone -- rebuilding a provider-backed accessor
-        // around a cached map would stop its credentials being fetched.
         if let Some(store_params) = write_params.store_params.as_mut() {
-            let mut options = store_params.storage_options().cloned().unwrap_or_default();
-            let mut removed = false;
-            for key in [
-                OPT_NEW_TABLE_STORAGE_VERSION,
-                OPT_NEW_TABLE_V2_MANIFEST_PATHS,
-                OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS,
-            ] {
-                removed |= options.remove(key).is_some();
-            }
-            if removed {
-                let provider = store_params
-                    .storage_options_accessor
-                    .as_ref()
-                    .and_then(|accessor| accessor.provider().cloned());
-                store_params.storage_options_accessor = match (options.is_empty(), provider) {
-                    (true, None) => None,
-                    (true, Some(provider)) => {
-                        Some(Arc::new(StorageOptionsAccessor::with_provider(provider)))
-                    }
-                    (false, Some(provider)) => Some(Arc::new(
-                        StorageOptionsAccessor::with_initial_and_provider(options, provider),
-                    )),
-                    (false, None) => Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                        options,
-                    ))),
-                };
-            }
+            strip_new_table_creation_keys(store_params);
         }
 
         // Only modify the storage options if we actually have something to
@@ -1323,8 +1292,165 @@ impl Database for ListingDatabase {
     }
 }
 
+/// Remove the `new_table_*` creation keys from a request's store options:
+/// they are creation configuration, not store credentials, and left in place
+/// they fork a fresh store connection for the request. An accessor carrying
+/// none of them is left untouched -- rebuilding a provider-backed accessor
+/// around a cached map would stop its credentials being fetched.
+fn strip_new_table_creation_keys(store_params: &mut ObjectStoreParams) {
+    let mut options = store_params.storage_options().cloned().unwrap_or_default();
+    let mut removed = false;
+    for key in [
+        OPT_NEW_TABLE_STORAGE_VERSION,
+        OPT_NEW_TABLE_V2_MANIFEST_PATHS,
+        OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS,
+    ] {
+        removed |= options.remove(key).is_some();
+    }
+    if !removed {
+        return;
+    }
+    let provider = store_params
+        .storage_options_accessor
+        .as_ref()
+        .and_then(|accessor| accessor.provider().cloned());
+    store_params.storage_options_accessor = match (options.is_empty(), provider) {
+        (true, None) => None,
+        (true, Some(provider)) => Some(Arc::new(StorageOptionsAccessor::with_provider(provider))),
+        (false, Some(provider)) => Some(Arc::new(
+            StorageOptionsAccessor::with_initial_and_provider(options, provider),
+        )),
+        (false, None) => Some(Arc::new(StorageOptionsAccessor::with_static_options(
+            options,
+        ))),
+    };
+}
+
 #[cfg(test)]
 mod tests {
+    mod strip_new_table_creation_keys {
+        use super::super::*;
+
+        #[derive(Debug)]
+        struct EmptyProvider;
+
+        #[async_trait::async_trait]
+        impl StorageOptionsProvider for EmptyProvider {
+            async fn fetch_storage_options(
+                &self,
+            ) -> lance_core::Result<Option<HashMap<String, String>>> {
+                Ok(Some(HashMap::new()))
+            }
+
+            fn provider_id(&self) -> String {
+                "empty-test-provider".into()
+            }
+        }
+
+        fn params_with_static(options: &[(&str, &str)]) -> ObjectStoreParams {
+            ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_static_options(
+                        options
+                            .iter()
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                            .collect(),
+                    ),
+                )),
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn creation_keys_are_removed_and_store_keys_kept() {
+            let mut params = params_with_static(&[
+                ("region", "us-west-2"),
+                (OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS, "true"),
+            ]);
+            strip_new_table_creation_keys(&mut params);
+            let options = params.storage_options().cloned().unwrap();
+            assert_eq!(options.get("region").map(String::as_str), Some("us-west-2"));
+            assert!(!options.contains_key(OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS));
+        }
+
+        /// A request carrying only creation keys keeps the connection's
+        /// store: no accessor survives to fork a new one.
+        #[test]
+        fn only_creation_keys_leaves_no_accessor() {
+            let mut params = params_with_static(&[(OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS, "true")]);
+            strip_new_table_creation_keys(&mut params);
+            assert!(params.storage_options_accessor.is_none());
+        }
+
+        /// An accessor carrying no creation keys is not rebuilt: rebuilding a
+        /// provider-backed accessor around a cached map would stop its
+        /// credentials being fetched.
+        #[test]
+        fn untouched_provider_accessor_is_preserved() {
+            let accessor = Arc::new(StorageOptionsAccessor::with_provider(Arc::new(
+                EmptyProvider,
+            )));
+            let mut params = ObjectStoreParams {
+                storage_options_accessor: Some(accessor.clone()),
+                ..Default::default()
+            };
+            strip_new_table_creation_keys(&mut params);
+            assert!(Arc::ptr_eq(
+                params.storage_options_accessor.as_ref().unwrap(),
+                &accessor
+            ));
+        }
+
+        /// Stripping every static option from a provider-backed accessor must
+        /// yield a first-fetch accessor, not one caching an empty map.
+        #[test]
+        fn emptied_provider_accessor_still_fetches() {
+            let mut params = ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_initial_and_provider(
+                        HashMap::from([(
+                            OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS.to_string(),
+                            "true".to_string(),
+                        )]),
+                        Arc::new(EmptyProvider),
+                    ),
+                )),
+                ..Default::default()
+            };
+            strip_new_table_creation_keys(&mut params);
+            let accessor = params.storage_options_accessor.unwrap();
+            assert!(accessor.has_provider());
+            assert!(accessor.initial_storage_options().is_none());
+        }
+
+        /// End to end: a create carrying only a creation key stays on the
+        /// connection's store and the option takes effect.
+        #[tokio::test]
+        async fn creation_key_only_create_stays_on_the_connection_store() {
+            use arrow_array::record_batch;
+
+            let conn = crate::connect("memory://").execute().await.unwrap();
+            let batch = record_batch!(("x", Int32, [1])).unwrap();
+            conn.create_table("t", batch)
+                .storage_option(OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS, "true")
+                .execute()
+                .await
+                .unwrap();
+
+            let table = conn.open_table("t").execute().await.unwrap();
+            let stable = table
+                .as_native()
+                .unwrap()
+                .dataset
+                .get()
+                .await
+                .unwrap()
+                .manifest
+                .uses_stable_row_ids();
+            assert!(stable);
+        }
+    }
+
     use super::*;
     use crate::Table;
     use crate::arrow::{SendableRecordBatchStream, SimpleRecordBatchStream};
