@@ -182,9 +182,21 @@ pub(crate) fn plan(
             });
         }
 
-        let expr = planner
+        let parsed = planner
             .parse_expr(expression)
-            .and_then(|expr| planner.optimize_expr(expr))
+            .map_err(|e| Error::InvalidExpression {
+                column: output.clone(),
+                message: e.to_string(),
+            })?;
+        // Before optimization: the simplifier folds a stable-but-not-immutable
+        // call like now() into a literal, hiding it from the check while the
+        // stored definition keeps the call.
+        ensure_immutable(&parsed, |message| Error::InvalidExpression {
+            column: output.clone(),
+            message,
+        })?;
+        let expr = planner
+            .optimize_expr(parsed)
             .map_err(|e| Error::InvalidExpression {
                 column: output.clone(),
                 message: e.to_string(),
@@ -225,6 +237,9 @@ pub(crate) fn plan(
             .map_err(|e| Error::InvalidInput {
                 message: format!("invalid view filter: {e}"),
             })?;
+        ensure_immutable(&expr, |message| Error::InvalidInput {
+            message: format!("invalid view filter: {message}"),
+        })?;
         let filter_inputs = resolve_inputs(&source_schema, &expr, |message| Error::InvalidInput {
             message: format!("invalid view filter: {message}"),
         })?;
@@ -261,6 +276,33 @@ pub(crate) fn plan(
         inputs,
     };
     Ok((definition, fields))
+}
+
+/// Reject any function that is not immutable: a view definition has to
+/// evaluate identically across refreshes, or incremental maintenance would
+/// mix rows from different evaluations of the same definition.
+fn ensure_immutable(expr: &datafusion_expr::Expr, error: impl Fn(String) -> Error) -> Result<()> {
+    use datafusion_common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion_expr::Volatility;
+
+    let mut offending: Option<String> = None;
+    expr.apply(|node| {
+        if let datafusion_expr::Expr::ScalarFunction(function) = node {
+            if function.func.signature().volatility != Volatility::Immutable {
+                offending = Some(function.func.name().to_string());
+                return Ok(TreeNodeRecursion::Stop);
+            }
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .map_err(|e| error(e.to_string()))?;
+    match offending {
+        Some(name) => Err(error(format!(
+            "function '{name}' is not immutable and would evaluate differently \
+             across refreshes"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// The root of a possibly-dotted column path: `metadata.age` -> `metadata`.
@@ -965,6 +1007,38 @@ mod tests {
         assert!(matches!(err, Error::NotSupported { .. }));
         let err = conn.list_materialized_views().await.unwrap_err();
         assert!(matches!(err, Error::NotSupported { .. }));
+    }
+
+    /// A definition must evaluate identically across refreshes; anything
+    /// less makes incremental maintenance a mix of evaluations.
+    #[tokio::test]
+    async fn test_volatile_and_unstable_expressions_are_rejected() {
+        let conn = people_db().await;
+        for expression in ["random()", "now()"] {
+            let err = conn
+                .create_materialized_view("bad", "people")
+                .select([("x", expression)])
+                .execute()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidExpression { message, .. }
+                    if message.contains("not immutable")),
+                "{expression} was not rejected"
+            );
+        }
+        for filter in ["age > random() * 100", "age >= 0 and now() is not null"] {
+            let err = conn
+                .create_materialized_view("bad", "people")
+                .only_if(filter)
+                .execute()
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidInput { message } if message.contains("not immutable")),
+                "{filter} was not rejected"
+            );
+        }
     }
 
     #[tokio::test]
