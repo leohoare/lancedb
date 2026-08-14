@@ -2021,6 +2021,10 @@ class AsyncConnection(object):
         Raises ``ValueError`` if the table exists but is not a materialized
         view.
         """
+        if self.uri.startswith("db://"):
+            raise NotImplementedError(
+                "materialized views are supported only on local databases"
+            )
         view = AsyncMaterializedView(await self.open_table(name))
         await view.definition()
         return view

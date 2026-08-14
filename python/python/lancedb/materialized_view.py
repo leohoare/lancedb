@@ -68,9 +68,17 @@ def _definition_from_schema(
     )
 
 
+def _quote_identifier(name: str) -> str:
+    """Quote a column name as a Lance SQL identifier (backticks)."""
+    escaped = name.replace("`", "``")
+    return f"`{escaped}`"
+
+
 def normalize_select(select: SelectArg) -> Optional[List[Tuple[str, str]]]:
     """``select`` items may be a column name, an ``(alias, expression)`` pair,
-    or a dict of the same; a bare name projects itself."""
+    or a dict of the same. A bare name projects itself and is quoted, so any
+    valid column name works; dict and pair entries are kept verbatim because
+    their right side is an expression."""
     if select is None:
         return None
     if isinstance(select, dict):
@@ -78,7 +86,7 @@ def normalize_select(select: SelectArg) -> Optional[List[Tuple[str, str]]]:
     normalized = []
     for item in select:
         if isinstance(item, str):
-            normalized.append((item, item))
+            normalized.append((item, _quote_identifier(item)))
         else:
             alias, expression = item
             normalized.append((alias, expression))
@@ -121,6 +129,11 @@ class AsyncMaterializedView:
         last one, and otherwise rebuilds. ``full=True`` forces a rebuild;
         ``source_version`` refreshes to that source version instead of the
         latest.
+
+        Refreshes of one view are serialized within a process. Nothing
+        serializes them across processes: two concurrent refreshes of the
+        same view from different processes can append duplicate rows. Run
+        one process's refreshes against a view at a time.
         """
         return await self._table._inner.refresh_materialized_view(
             full=full, source_version=source_version

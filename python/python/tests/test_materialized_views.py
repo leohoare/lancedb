@@ -133,3 +133,30 @@ def test_source_requires_stable_row_ids(tmp_path):
     db.create_table("plain", [{"x": 1}])
     with pytest.raises(Exception, match="stable row ids"):
         db.create_materialized_view("v", "plain")
+
+
+def test_bare_select_names_are_quoted(tmp_path):
+    db = lancedb.connect(tmp_path, storage_options=STABLE_ROW_IDS)
+    db.create_table("odd_names", [{"order item": "widget", "select": 2}])
+
+    view = db.create_materialized_view(
+        "quoted", "odd_names", select=["order item", "select"]
+    )
+    result = view.refresh()
+    assert result.rows_written == 1
+    rows = view.table.search().to_list()
+    assert rows[0]["order item"] == "widget"
+    assert rows[0]["select"] == 2
+
+
+@pytest.mark.asyncio
+async def test_async_remote_is_refused_without_network():
+    db = await lancedb.connect_async(
+        "db://nowhere", api_key="sk_test", region="us-east-1"
+    )
+    with pytest.raises(NotImplementedError, match="local"):
+        await db.create_materialized_view("v", "src")
+    with pytest.raises(NotImplementedError, match="local"):
+        await db.open_materialized_view("v")
+    with pytest.raises(NotImplementedError, match="local"):
+        await db.list_materialized_views()

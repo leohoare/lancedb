@@ -363,10 +363,7 @@ impl Connection {
         let inner = self_.get_inner()?.clone();
         future_into_py(self_.py(), async move {
             let views = inner.list_materialized_views().await.infer_error()?;
-            Ok(views
-                .iter()
-                .map(|view| view.name().to_string())
-                .collect::<Vec<_>>())
+            Ok(views.into_iter().map(|view| view.name).collect::<Vec<_>>())
         })
     }
 
