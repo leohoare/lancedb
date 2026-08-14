@@ -225,11 +225,26 @@ pub(crate) fn plan(
             .map_err(|e| Error::InvalidInput {
                 message: format!("invalid view filter: {e}"),
             })?;
-        inputs.extend(resolve_inputs(&source_schema, &expr, |message| {
-            Error::InvalidInput {
-                message: format!("invalid view filter: {message}"),
-            }
-        })?);
+        let filter_inputs = resolve_inputs(&source_schema, &expr, |message| Error::InvalidInput {
+            message: format!("invalid view filter: {message}"),
+        })?;
+        // A committed filter has to be usable as a predicate.
+        let read_schema = project_schema(&source_schema, &filter_inputs);
+        let data_type = Planner::new(read_schema.clone())
+            .create_physical_expr(&expr)
+            .map_err(|e| Error::InvalidInput {
+                message: format!("invalid view filter: {e}"),
+            })?
+            .data_type(read_schema.as_ref())
+            .map_err(|e| Error::InvalidInput {
+                message: format!("invalid view filter: {e}"),
+            })?;
+        if data_type != DataType::Boolean {
+            return Err(Error::InvalidInput {
+                message: format!("view filter must be a boolean predicate, not {data_type}"),
+            });
+        }
+        inputs.extend(filter_inputs);
     }
 
     inputs.sort();
@@ -248,7 +263,13 @@ pub(crate) fn plan(
     Ok((definition, fields))
 }
 
-/// The columns `expr` reads, each verified to exist in `schema`.
+/// The root of a possibly-dotted column path: `metadata.age` -> `metadata`.
+fn root(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
+}
+
+/// The columns `expr` reads, kept as the planner reports them (a nested
+/// reference stays a dotted path) but resolved by root field.
 fn resolve_inputs(
     schema: &ArrowSchema,
     expr: &datafusion_expr::Expr,
@@ -258,19 +279,44 @@ fn resolve_inputs(
     inputs.sort();
     inputs.dedup();
     for input in &inputs {
-        if schema.field_with_name(input).is_err() {
+        if schema.field_with_name(root(input)).is_err() {
             return Err(error(format!("unknown column '{input}'")));
         }
     }
     Ok(inputs)
 }
 
+/// Project the root fields of `columns`, deduplicated, in schema order.
 fn project_schema(schema: &ArrowSchema, columns: &[String]) -> SchemaRef {
-    let fields: Vec<ArrowField> = columns
+    let roots: std::collections::HashSet<&str> = columns.iter().map(|c| root(c)).collect();
+    let fields: Vec<ArrowField> = schema
+        .fields()
         .iter()
-        .filter_map(|name| schema.field_with_name(name).ok().cloned())
+        .filter(|f| roots.contains(f.name().as_str()))
+        .map(|f| f.as_ref().clone())
         .collect();
     Arc::new(ArrowSchema::new(fields))
+}
+
+/// One row of [`Connection::list_materialized_views`]: a view's name and its
+/// definition kind, which may be one this version cannot refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedViewEntry {
+    /// Name of the view's table.
+    pub name: String,
+    /// The view's definition as stored.
+    pub kind: MaterializedViewKind,
+}
+
+/// Materialized views are local-only; refuse a remote connection before any
+/// request is made.
+fn ensure_local(connection: &Connection) -> Result<()> {
+    if connection.uri().starts_with("db://") {
+        return Err(Error::NotSupported {
+            message: "materialized views are supported only on local databases".into(),
+        });
+    }
+    Ok(())
 }
 
 /// Builds a materialized view. Created by
@@ -330,6 +376,7 @@ impl CreateMaterializedViewBuilder {
     /// view's provenance valid across source compactions, updates and
     /// deletes, and they cannot be enabled after a table exists.
     pub async fn execute(self) -> Result<MaterializedView> {
+        ensure_local(&self.connection)?;
         let source = self.connection.open_table(&self.source).execute().await?;
         let Some(native) = source.as_native() else {
             return Err(Error::NotSupported {
@@ -376,6 +423,22 @@ impl CreateMaterializedViewBuilder {
             })
             .execute()
             .await?;
+        let stable = match table.as_native() {
+            Some(native) => native.dataset.get().await?.manifest.uses_stable_row_ids(),
+            None => false,
+        };
+        if !stable {
+            let _ = self.connection.drop_table(&self.name, &[]).await;
+            return Err(Error::InvalidInput {
+                message: format!(
+                    "view '{}' would be created without stable row ids: the \
+                     connection's new_table_enable_stable_row_ids setting \
+                     overrides view creation; remove it or use a connection \
+                     without it",
+                    self.name
+                ),
+            });
+        }
         Ok(MaterializedView { table, definition })
     }
 }
@@ -457,16 +520,20 @@ impl Connection {
         &self,
         name: impl Into<String>,
     ) -> Result<MaterializedView> {
+        ensure_local(self)?;
         let table = self.open_table(name).execute().await?;
         MaterializedView::from_table(table).await
     }
 
-    /// The materialized views in this database.
+    /// The materialized views in this database, unrefreshable kinds
+    /// included: a view written by a newer version lists with its kind
+    /// preserved rather than disappearing.
     ///
     /// Reads every table's schema to find them, so this costs an open per
     /// table. A table that cannot be opened is skipped rather than failing
     /// the listing.
-    pub async fn list_materialized_views(&self) -> Result<Vec<MaterializedView>> {
+    pub async fn list_materialized_views(&self) -> Result<Vec<MaterializedViewEntry>> {
+        ensure_local(self)?;
         let names = self.table_names().execute().await?;
         let mut views = Vec::new();
         for name in names {
@@ -474,10 +541,8 @@ impl Connection {
                 continue;
             };
             let schema = table.schema().await?;
-            if let Some(MaterializedViewKind::Select(definition)) =
-                materialized_view_kind(schema.metadata())?
-            {
-                views.push(MaterializedView { table, definition });
+            if let Some(kind) = materialized_view_kind(schema.metadata())? {
+                views.push(MaterializedViewEntry { name, kind });
             }
         }
         Ok(views)
@@ -490,6 +555,7 @@ mod tests {
 
     use super::*;
     use crate::connect;
+    use crate::table::WriteOptions;
 
     async fn people_db() -> Connection {
         let conn = connect("memory://").execute().await.unwrap();
@@ -755,10 +821,150 @@ mod tests {
 
         let views = conn.list_materialized_views().await.unwrap();
         assert_eq!(
-            views.iter().map(|v| v.name()).collect::<Vec<_>>(),
+            views.iter().map(|v| v.name.as_str()).collect::<Vec<_>>(),
             vec!["adults"]
         );
-        assert_eq!(views[0].definition().filter.as_deref(), Some("age >= 18"));
+        let MaterializedViewKind::Select(definition) = &views[0].kind else {
+            panic!("expected a select view");
+        };
+        assert_eq!(definition.filter.as_deref(), Some("age >= 18"));
+    }
+
+    /// A connection override that would create the view without stable row
+    /// ids fails loudly instead of committing an unchainable view.
+    #[tokio::test]
+    async fn test_conflicting_connection_override_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let uri = dir.path().to_str().unwrap();
+        let stable_conn = connect(uri).execute().await.unwrap();
+        let batch = record_batch!(("x", Int32, [1])).unwrap();
+        stable_conn
+            .create_table("src", batch)
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        let unstable_conn = connect(uri)
+            .storage_options([("new_table_enable_stable_row_ids", "false")])
+            .execute()
+            .await
+            .unwrap();
+        let err = unstable_conn
+            .create_materialized_view("v", "src")
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidInput { message } if message.contains("stable row ids"))
+        );
+        assert!(
+            !unstable_conn
+                .table_names()
+                .execute()
+                .await
+                .unwrap()
+                .contains(&"v".to_string())
+        );
+    }
+
+    /// A committed filter has to be usable as a predicate.
+    #[tokio::test]
+    async fn test_non_boolean_filter_is_rejected() {
+        let conn = people_db().await;
+        let err = conn
+            .create_materialized_view("bad", "people")
+            .only_if("age + 1")
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidInput { message } if message.contains("boolean")),);
+    }
+
+    /// Nested references stay dotted paths; resolution is by root field.
+    #[tokio::test]
+    async fn test_struct_columns_can_be_declared() {
+        use arrow_array::{ArrayRef, Int32Array, StructArray};
+
+        let conn = connect("memory://").execute().await.unwrap();
+        let ages = StructArray::from(vec![(
+            Arc::new(ArrowField::new("age", DataType::Int32, false)),
+            Arc::new(Int32Array::from(vec![36, 17])) as ArrayRef,
+        )]);
+        let batch =
+            arrow_array::RecordBatch::try_from_iter(vec![("metadata", Arc::new(ages) as ArrayRef)])
+                .unwrap();
+        conn.create_table("people", batch)
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        let view = conn
+            .create_materialized_view("ages", "people")
+            .select([("age", "metadata.age")])
+            .only_if("metadata.age >= 18")
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(view.definition().inputs, vec!["metadata.age"]);
+        let schema = view.table().schema().await.unwrap();
+        assert_eq!(
+            schema.field_with_name("age").unwrap().data_type(),
+            &DataType::Int32
+        );
+    }
+
+    /// A newer-kind view must not disappear from the listing.
+    #[tokio::test]
+    async fn test_unrecognized_kind_is_listed_with_its_kind() {
+        let conn = people_db().await;
+        conn.create_materialized_view("v", "people")
+            .execute()
+            .await
+            .unwrap();
+        let table = conn.open_table("v").execute().await.unwrap();
+        table
+            .as_native()
+            .unwrap()
+            .replace_schema_metadata(HashMap::from([(
+                DEFINITION_META_KEY.to_string(),
+                r#"{"kind": "join"}"#.to_string(),
+            )]))
+            .await
+            .unwrap();
+
+        let views = conn.list_materialized_views().await.unwrap();
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].name, "v");
+        assert_eq!(
+            views[0].kind,
+            MaterializedViewKind::Unrecognized {
+                kind: "join".into()
+            }
+        );
+    }
+
+    /// Remote connections are refused before any request is made.
+    #[cfg(feature = "remote")]
+    #[tokio::test]
+    async fn test_remote_connection_is_refused_up_front() {
+        let conn = connect("db://nowhere")
+            .api_key("sk_test")
+            .region("us-east-1")
+            .execute()
+            .await
+            .unwrap();
+        let err = conn
+            .create_materialized_view("v", "src")
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }));
+        let err = conn.open_materialized_view("v").await.unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }));
+        let err = conn.list_materialized_views().await.unwrap_err();
+        assert!(matches!(err, Error::NotSupported { .. }));
     }
 
     #[tokio::test]
