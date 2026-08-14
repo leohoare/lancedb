@@ -821,29 +821,37 @@ impl ListingDatabase {
 
         // The new-table keys are creation configuration, not store options:
         // strip them so a request carrying only them keeps the connection's
-        // store instead of forking a new one.
+        // store instead of forking a new one. An accessor that carried none
+        // of them is left alone -- rebuilding a provider-backed accessor
+        // around a cached map would stop its credentials being fetched.
         if let Some(store_params) = write_params.store_params.as_mut() {
             let mut options = store_params.storage_options().cloned().unwrap_or_default();
+            let mut removed = false;
             for key in [
                 OPT_NEW_TABLE_STORAGE_VERSION,
                 OPT_NEW_TABLE_V2_MANIFEST_PATHS,
                 OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS,
             ] {
-                options.remove(key);
+                removed |= options.remove(key).is_some();
             }
-            let provider = store_params
-                .storage_options_accessor
-                .as_ref()
-                .and_then(|accessor| accessor.provider().cloned());
-            store_params.storage_options_accessor = match (options.is_empty(), provider) {
-                (true, None) => None,
-                (_, Some(provider)) => Some(Arc::new(
-                    StorageOptionsAccessor::with_initial_and_provider(options, provider),
-                )),
-                (false, None) => Some(Arc::new(StorageOptionsAccessor::with_static_options(
-                    options,
-                ))),
-            };
+            if removed {
+                let provider = store_params
+                    .storage_options_accessor
+                    .as_ref()
+                    .and_then(|accessor| accessor.provider().cloned());
+                store_params.storage_options_accessor = match (options.is_empty(), provider) {
+                    (true, None) => None,
+                    (true, Some(provider)) => {
+                        Some(Arc::new(StorageOptionsAccessor::with_provider(provider)))
+                    }
+                    (false, Some(provider)) => Some(Arc::new(
+                        StorageOptionsAccessor::with_initial_and_provider(options, provider),
+                    )),
+                    (false, None) => Some(Arc::new(StorageOptionsAccessor::with_static_options(
+                        options,
+                    ))),
+                };
+            }
         }
 
         // Only modify the storage options if we actually have something to
