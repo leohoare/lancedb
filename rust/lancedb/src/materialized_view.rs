@@ -1016,13 +1016,7 @@ impl RefreshMaterializedViewBuilder {
     }
 
     pub async fn execute(self) -> Result<RefreshMaterializedViewResult> {
-        refresh::execute_refresh(
-            &self.view.table,
-            &self.view.definition,
-            self.full,
-            self.source_version,
-        )
-        .await
+        refresh::execute_refresh(&self.view.table, self.full, self.source_version).await
     }
 }
 

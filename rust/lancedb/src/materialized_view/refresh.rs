@@ -106,7 +106,6 @@ fn refresh_lock(uri: &str) -> Arc<tokio::sync::Mutex<()>> {
 /// Internal implementation of the refresh logic.
 pub(crate) async fn execute_refresh(
     view: &Table,
-    definition: &MaterializedViewDefinition,
     full: bool,
     pinned: Option<u64>,
 ) -> Result<RefreshMaterializedViewResult> {
@@ -122,6 +121,27 @@ pub(crate) async fn execute_refresh(
     // reporting NoOp over a mutated view.
     view_native.dataset.reload().await?;
     let view_ds = view_native.dataset.get().await?.as_ref().clone();
+
+    // The definition a handle cached at open may since have been replaced;
+    // what refresh executes and what it stamps must be one generation.
+    let definition = match super::materialized_view_kind(&view_ds.schema().metadata)? {
+        Some(super::MaterializedViewKind::Select(definition)) => definition,
+        Some(super::MaterializedViewKind::Unrecognized { kind }) => {
+            return Err(Error::NotSupported {
+                message: format!(
+                    "materialized view '{}' is defined by '{kind}', which this \
+                     version of lancedb cannot refresh",
+                    view.name()
+                ),
+            });
+        }
+        None => {
+            return Err(Error::NotAMaterializedView {
+                name: view.name().to_string(),
+            });
+        }
+    };
+    let definition = &definition;
 
     let source_ds = open_source(view, definition).await?;
     let source_ds = match pinned {
@@ -474,6 +494,18 @@ async fn incremental(
         })
         .execute_stream(stream)
         .await?;
+    // Lance rebases an append over an intervening delete or update; a data
+    // commit that did not land directly on the planned generation may have
+    // absorbed one and must not be certified.
+    if appended.version().version != view_ds.version().version + 1 {
+        return Err(Error::Runtime {
+            message: format!(
+                "a concurrent commit raced this refresh (view version {}); the \
+                 refresh is unrecorded and the next one will rebuild",
+                appended.version().version
+            ),
+        });
+    }
     result.rows_written = rows_written.load(Ordering::Relaxed);
     result.version = stamp_watermark(view_native, appended, source_version, source_ts).await?;
     Ok(result)
@@ -623,9 +655,19 @@ async fn replace_retaining_indices(
         },
         None,
     );
-    Ok(CommitBuilder::new(WriteDestination::Dataset(ds))
+    let committed = CommitBuilder::new(WriteDestination::Dataset(ds))
         .execute(transaction)
-        .await?)
+        .await?;
+    if committed.version().version != read_version + 1 {
+        return Err(Error::Runtime {
+            message: format!(
+                "a concurrent commit raced this refresh (view version {}); the \
+                 refresh is unrecorded and the next one will rebuild",
+                committed.version().version
+            ),
+        });
+    }
+    Ok(committed)
 }
 
 /// Record that the view now reflects `source_version`, including the view
@@ -1337,6 +1379,47 @@ mod tests {
         let result = view.refresh().execute().await.unwrap();
         assert_eq!(result.mode, RefreshMode::Rebuild);
         assert_eq!(read(view.table(), "twice").await, vec![2, 4]);
+    }
+
+    /// What refresh executes and what it stamps must be one generation: a
+    /// replaced definition wins over whatever a stale handle cached.
+    #[tokio::test]
+    async fn test_refresh_uses_the_latest_persisted_definition() {
+        let (conn, _) = db_with_source(vec![1, 2]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        let replacement = crate::materialized_view::MaterializedViewDefinition {
+            source_table: "src".into(),
+            projections: vec![
+                crate::materialized_view::ViewProjection {
+                    output: "x".into(),
+                    expression: "x".into(),
+                },
+                crate::materialized_view::ViewProjection {
+                    output: "twice".into(),
+                    expression: "x * 3".into(),
+                },
+            ],
+            filter: None,
+            limit: None,
+            inputs: vec!["x".into()],
+        };
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            crate::materialized_view::DEFINITION_META_KEY.to_string(),
+            crate::materialized_view::definition_to_metadata(&replacement).unwrap(),
+        );
+        view.table()
+            .as_native()
+            .unwrap()
+            .replace_schema_metadata(metadata)
+            .await
+            .unwrap();
+
+        let result = view.refresh().execute().await.unwrap();
+        assert_eq!(result.mode, RefreshMode::Rebuild);
+        assert_eq!(read(view.table(), "twice").await, vec![3, 6]);
     }
 
     /// An output whose name needs quoting flows through as a projection
