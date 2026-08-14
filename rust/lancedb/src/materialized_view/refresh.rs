@@ -16,11 +16,10 @@
 //! fragments in one commit that retains index definitions, so readers never
 //! see the view unindexed or empty.
 //!
-//! The watermark ([`SOURCE_VERSION_META_KEY`]) is stamped after the data
-//! commit, not atomically with it, except on the unindexed rebuild path where
-//! it rides the overwrite. A crash between the two can leave the watermark
-//! behind the data; the next incremental refresh would then re-append rows it
-//! already holds.
+//! The watermark ([`SOURCE_VERSION_META_KEY`]) is stamped in a follow-up
+//! commit after the data lands. A crash or race between the two leaves the
+//! view visibly unstamped -- its recorded generation no longer matches --
+//! and the next refresh rebuilds rather than trusting any of it.
 //!
 //! Refreshes of one view are serialized within a process by a per-view lock.
 //! Across processes nothing serializes them, and two incremental refreshes
@@ -41,7 +40,6 @@ use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteDestination, WriteMode, WriteParams};
-use lance::index::DatasetIndexExt;
 use lance_core::ROW_ID;
 use lance_table::format::Fragment;
 use serde::{Deserialize, Serialize};
@@ -385,26 +383,46 @@ async fn appends_and_rewrites(cur: &Dataset, from: u64, to: u64) -> Option<TxnDe
 /// which is what lets this tier pass deltas the transaction walk cannot
 /// (a backfill of an unrelated column, an added all-null column).
 fn is_pure_append(old: &Dataset, cur: &Dataset, relevant: &HashSet<i32>) -> bool {
-    let signature = |fragment: &lance::dataset::fragment::FileFragment| -> (u64, String) {
-        let metadata = fragment.metadata();
-        let mut files: Vec<&str> = metadata
-            .files
-            .iter()
-            .filter(|file| {
-                relevant.is_empty() || file.fields.iter().any(|id| relevant.contains(id))
-            })
-            .map(|file| file.path.as_str())
-            .collect();
-        files.sort_unstable();
-        (
-            fragment.id() as u64,
-            format!("{}|{:?}", files.join(","), metadata.deletion_file),
-        )
+    let signature = |fragment: &lance::dataset::fragment::FileFragment| {
+        fragment_signature(fragment.metadata(), relevant)
     };
     let current: HashSet<(u64, String)> = cur.get_fragments().iter().map(signature).collect();
     old.get_fragments()
         .iter()
         .all(|fragment| current.contains(&signature(fragment)))
+}
+
+/// A fragment's identity as far as the view can observe it: the data files
+/// and overlays touching the columns the view reads, plus the deletion file.
+/// An overlay replaces cell values without changing any file path, so its
+/// identity has to be part of the signature or an overlaid source would
+/// classify as a pure append.
+fn fragment_signature(metadata: &Fragment, relevant: &HashSet<i32>) -> (u64, String) {
+    let touches_relevant =
+        |fields: &[i32]| relevant.is_empty() || fields.iter().any(|id| relevant.contains(id));
+    let mut files: Vec<&str> = metadata
+        .files
+        .iter()
+        .filter(|file| touches_relevant(&file.fields))
+        .map(|file| file.path.as_str())
+        .collect();
+    files.sort_unstable();
+    let mut overlays: Vec<String> = metadata
+        .overlays
+        .iter()
+        .filter(|overlay| touches_relevant(&overlay.data_file.fields))
+        .map(|overlay| format!("{}@{}", overlay.data_file.path, overlay.committed_version))
+        .collect();
+    overlays.sort_unstable();
+    (
+        metadata.id,
+        format!(
+            "{}|{}|{:?}",
+            files.join(","),
+            overlays.join(","),
+            metadata.deletion_file
+        ),
+    )
 }
 
 /// Field ids (with struct descendants) of the source columns the view reads.
@@ -560,85 +578,23 @@ async fn rebuild(
     source_ts: u128,
     definition: &MaterializedViewDefinition,
 ) -> Result<RefreshMaterializedViewResult> {
-    let indexed = !view_ds.load_indices().await?.is_empty();
     let rows_written = Arc::new(AtomicU64::new(0));
-
-    let new_dataset = if indexed {
-        let schema = Arc::new(ArrowSchema::from(view_ds.schema()));
-        let stream = compute_stream(
-            source_ds,
-            definition,
-            None,
-            definition.limit,
-            schema,
-            rows_written.clone(),
-        )
-        .await?;
-        let replaced = replace_retaining_indices(view_ds.clone(), stream).await?;
-        // The swap keeps the previous schema metadata, watermark included, so
-        // it is restamped in a follow-up commit.
-        let version = stamp_watermark(view_native, replaced, source_version, source_ts).await?;
-        return Ok(RefreshMaterializedViewResult {
-            mode: RefreshMode::Rebuild,
-            rows_written: rows_written.load(Ordering::Relaxed),
-            source_version,
-            version,
-        });
-    } else {
-        // An overwrite adopts the stream's schema, so the watermark rides the
-        // same commit as the data.
-        let mut metadata = view_ds.schema().metadata.clone();
-        metadata.insert(
-            SOURCE_VERSION_META_KEY.to_string(),
-            source_version.to_string(),
-        );
-        metadata.insert(
-            SOURCE_VERSION_TS_META_KEY.to_string(),
-            source_ts.to_string(),
-        );
-        metadata.insert(REFRESHED_AT_MS_META_KEY.to_string(), now_ms().to_string());
-        // The overwrite is the refresh's final commit when nothing races it;
-        // the stamped view version is verified below and re-stamped if not.
-        let predicted = view_ds.version().version + 1;
-        metadata.insert(VIEW_VERSION_META_KEY.to_string(), predicted.to_string());
-        let schema = Arc::new(ArrowSchema::from(view_ds.schema()).with_metadata(metadata));
-        let stream = compute_stream(
-            source_ds,
-            definition,
-            None,
-            definition.limit,
-            schema,
-            rows_written.clone(),
-        )
-        .await?;
-        InsertBuilder::new(WriteDestination::Dataset(Arc::new(view_ds.clone())))
-            .with_params(&WriteParams {
-                mode: WriteMode::Overwrite,
-                enable_stable_row_ids: true,
-                ..Default::default()
-            })
-            .execute_stream(stream)
-            .await?
-    };
-
-    let version = new_dataset.version().version;
-    let recorded: Option<u64> = new_dataset
-        .schema()
-        .metadata
-        .get(VIEW_VERSION_META_KEY)
-        .and_then(|raw| raw.parse().ok());
-    if recorded != Some(version) {
-        // A commit raced between planning and the overwrite; the stamped
-        // generation is wrong and must not be certified. The data landed,
-        // the record did not: the next refresh rebuilds.
-        return Err(Error::Runtime {
-            message: format!(
-                "a concurrent commit raced this refresh (view version {version}); \
-                 the refresh is unrecorded and the next one will rebuild"
-            ),
-        });
-    }
-    view_native.dataset.update(new_dataset);
+    let schema = Arc::new(ArrowSchema::from(view_ds.schema()));
+    let stream = compute_stream(
+        source_ds,
+        definition,
+        None,
+        definition.limit,
+        schema,
+        rows_written.clone(),
+    )
+    .await?;
+    // Every rebuild is one fragment swap, indexed or not: an Update commit
+    // carries no schema metadata, so it cannot erase a definition update
+    // that raced in the way an overwrite (which adopts its stream's schema)
+    // durably would -- and it must land on the planned generation or abort.
+    let replaced = replace_retaining_indices(view_ds.clone(), stream).await?;
+    let version = stamp_watermark(view_native, replaced, source_version, source_ts).await?;
     Ok(RefreshMaterializedViewResult {
         mode: RefreshMode::Rebuild,
         rows_written: rows_written.load(Ordering::Relaxed),
@@ -1495,6 +1451,47 @@ mod tests {
 
         let err = view.refresh().execute().await.unwrap_err();
         assert!(matches!(err, Error::Schema { message } if message.contains("does not produce")),);
+    }
+
+    /// An overlay replaces cell values without changing any file path; the
+    /// signature must see it, scoped to the columns the view reads like
+    /// data files are.
+    #[test]
+    fn test_fragment_signature_sees_overlays() {
+        use lance_file::version::ConcreteFileVersion;
+        use lance_table::format::DataFile;
+        use lance_table::format::overlay::{DataOverlayFile, OverlayCoverage};
+
+        let base = Fragment::new(7);
+        let mut file = DataFile::new_unstarted("f0.lance", ConcreteFileVersion::V2_1);
+        file.fields = vec![0, 1].into();
+        let mut with_file = base.clone();
+        with_file.files.push(file.clone());
+
+        let overlay = |field: i32| {
+            let mut data_file = DataFile::new_unstarted("o0.lance", ConcreteFileVersion::V2_1);
+            data_file.fields = vec![field].into();
+            DataOverlayFile {
+                data_file,
+                coverage: OverlayCoverage::PerField(Vec::new()),
+                committed_version: 9,
+            }
+        };
+        let relevant: HashSet<i32> = [0].into_iter().collect();
+
+        let mut overlaid_relevant = with_file.clone();
+        overlaid_relevant.overlays.push(overlay(0));
+        assert_ne!(
+            fragment_signature(&with_file, &relevant),
+            fragment_signature(&overlaid_relevant, &relevant),
+        );
+
+        let mut overlaid_unrelated = with_file.clone();
+        overlaid_unrelated.overlays.push(overlay(5));
+        assert_eq!(
+            fragment_signature(&with_file, &relevant),
+            fragment_signature(&overlaid_unrelated, &relevant),
+        );
     }
 
     /// An output whose name needs quoting flows through as a projection
