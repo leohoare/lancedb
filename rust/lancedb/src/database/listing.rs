@@ -1423,6 +1423,37 @@ mod tests {
             assert!(accessor.initial_storage_options().is_none());
         }
 
+        /// Residual static options and the provider must both survive the
+        /// strip; losing the provider here would go unnoticed by the other
+        /// cases.
+        #[test]
+        fn mixed_static_and_provider_accessor_keeps_both() {
+            let mut params = ObjectStoreParams {
+                storage_options_accessor: Some(Arc::new(
+                    StorageOptionsAccessor::with_initial_and_provider(
+                        HashMap::from([
+                            ("region".to_string(), "us-west-2".to_string()),
+                            (
+                                OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS.to_string(),
+                                "true".to_string(),
+                            ),
+                        ]),
+                        Arc::new(EmptyProvider),
+                    ),
+                )),
+                ..Default::default()
+            };
+            strip_new_table_creation_keys(&mut params);
+            let accessor = params.storage_options_accessor.unwrap();
+            assert!(accessor.has_provider());
+            let residual = accessor.initial_storage_options().unwrap();
+            assert_eq!(
+                residual.get("region").map(String::as_str),
+                Some("us-west-2")
+            );
+            assert!(!residual.contains_key(OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS));
+        }
+
         /// End to end: a create carrying only a creation key stays on the
         /// connection's store and the option takes effect.
         #[tokio::test]
