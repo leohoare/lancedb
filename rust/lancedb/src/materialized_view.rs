@@ -29,6 +29,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::connection::Connection;
 use crate::database::listing::OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS;
+use crate::database::{CreateTableRequest, Database, OpenTableRequest};
 use crate::table::Table;
 use crate::table::refresh::quote_identifier;
 use crate::{Error, Result};
@@ -351,6 +352,205 @@ fn project_schema(schema: &ArrowSchema, columns: &[String]) -> SchemaRef {
     Arc::new(ArrowSchema::new(fields))
 }
 
+/// A validated view declaration, ready to become a table: the complete
+/// physical schema -- the projected fields plus [`SOURCE_ROW_ID_COLUMN`] --
+/// with the definition stamped in its metadata under
+/// [`DEFINITION_META_KEY`]. Produced only by [`prepare_declaration`], so the
+/// pieces cannot be assembled separately.
+#[derive(Clone)]
+pub struct PreparedDeclaration {
+    schema: SchemaRef,
+    definition: MaterializedViewDefinition,
+    /// The source's own database: the only place
+    /// [`PreparedDeclaration::create`] will put the view, because refresh
+    /// resolves the recorded source name through the view's database.
+    database: Arc<dyn Database>,
+}
+
+impl std::fmt::Debug for PreparedDeclaration {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedDeclaration")
+            .field("definition", &self.definition)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PreparedDeclaration {
+    /// The query the declaration records.
+    pub fn definition(&self) -> &MaterializedViewDefinition {
+        &self.definition
+    }
+
+    /// Create the view table and verify it, consuming the declaration.
+    ///
+    /// The view goes in the source's own database, held since
+    /// [`prepare_declaration`]: refresh resolves the recorded source name
+    /// through the view's database, so there is nowhere else it could go.
+    /// The table is created empty from the prepared schema with stable row
+    /// ids (so the view can itself source another view), requested both as
+    /// write params and as the request-level creation option that outranks
+    /// database configuration, and verified rather than trusted because an
+    /// implementation may ignore both; nothing is rolled back on failure.
+    pub async fn create(self, name: &str) -> Result<MaterializedView> {
+        let empty: Vec<std::result::Result<arrow_array::RecordBatch, arrow_schema::ArrowError>> =
+            vec![];
+        let reader: Box<dyn arrow_array::RecordBatchReader + Send> =
+            Box::new(arrow_array::RecordBatchIterator::new(empty, self.schema));
+        let mut request = CreateTableRequest::new(name.to_string(), Box::new(reader));
+        let write_params = request
+            .write_options
+            .lance_write_params
+            .get_or_insert_with(Default::default);
+        write_params.enable_stable_row_ids = true;
+        let store_params = write_params
+            .store_params
+            .get_or_insert_with(Default::default);
+        crate::connection::merge_storage_options(
+            store_params,
+            [(
+                OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS.to_string(),
+                "true".to_string(),
+            )],
+        );
+        let table = self.database.clone().create_table(request).await?;
+        let table = Table::new(table, self.database);
+        let stable = match table.as_native() {
+            Some(native) => native.dataset.get().await?.manifest.uses_stable_row_ids(),
+            None => false,
+        };
+        if !stable {
+            return Err(Error::Runtime {
+                message: format!(
+                    "view '{name}' was created without stable row ids: the database \
+                     ignored the creation option; the table remains and is not \
+                     usable as a materialized view"
+                ),
+            });
+        }
+        Ok(MaterializedView {
+            table,
+            definition: self.definition,
+        })
+    }
+}
+
+/// Validate a view declaration against its live source and hold what its
+/// creation needs.
+///
+/// The caller's handle only nominates the source: the declaration is
+/// canonicalized through the coordinate a refresh will resolve -- the
+/// source's own database, root namespace, bare name -- and planned against
+/// the table that resolution reaches, so a handle that does not resolve
+/// back to itself (a location override, a foreign database) is rejected,
+/// as is a namespaced source, which the definition cannot record. Runs the
+/// same creation-time checks as [`Connection::create_materialized_view`]:
+/// the source must be a local table keeping stable row ids. Empty
+/// `projections` selects every source column as of now.
+///
+/// ```no_run
+/// # #![recursion_limit = "256"]
+/// # use lancedb::materialized_view::prepare_declaration;
+/// # async fn declare(source: &lancedb::Table) -> Result<(), Box<dyn std::error::Error>> {
+/// let prepared = prepare_declaration(
+///     source,
+///     &[("id".into(), "id".into()), ("double".into(), "value * 2".into())],
+///     Some("value > 0"),
+///     None,
+/// )
+/// .await?;
+/// let view = prepared.create("doubles").await?;
+/// # Ok(())
+/// # }
+/// ```
+pub async fn prepare_declaration(
+    source: &Table,
+    projections: &[(String, String)],
+    filter: Option<&str>,
+    limit: Option<u64>,
+) -> Result<PreparedDeclaration> {
+    let Some(caller_native) = source.as_native() else {
+        return Err(Error::NotSupported {
+            message: "materialized views are supported only on local databases".into(),
+        });
+    };
+    // The definition records the source by bare name; any other source
+    // form would be recorded as a name its refresh cannot resolve.
+    if !source.namespace().is_empty() {
+        return Err(Error::NotSupported {
+            message: format!(
+                "a namespaced source cannot be recorded in a view definition; \
+                 '{}' must be a root-namespace table",
+                source.name()
+            ),
+        });
+    }
+    let database = source
+        .database_opt()
+        .ok_or_else(|| Error::InvalidInput {
+            message: "the source was not opened through a database connection".into(),
+        })?
+        .clone();
+
+    // Canonicalize: resolve the recorded coordinate exactly the way a
+    // refresh will, and plan from what it reaches. A handle that does not
+    // resolve back to itself must not be declared under this name.
+    let resolved = database
+        .open_table(OpenTableRequest {
+            name: source.name().to_string(),
+            namespace_path: vec![],
+            index_cache_size: None,
+            lance_read_params: None,
+            location: None,
+            namespace_client: None,
+            managed_versioning: None,
+        })
+        .await?;
+    let resolved = Table::new(resolved, database.clone());
+    let Some(native) = resolved.as_native() else {
+        return Err(Error::NotSupported {
+            message: "materialized views are supported only on local databases".into(),
+        });
+    };
+    let caller_uri = caller_native.dataset.get().await?.uri().to_string();
+    let resolved_uri = native.dataset.get().await?.uri().to_string();
+    if caller_uri != resolved_uri {
+        return Err(Error::InvalidInput {
+            message: format!(
+                "the source handle does not resolve to itself through its \
+                 database: '{}' resolves to '{resolved_uri}', but the handle \
+                 reads '{caller_uri}'",
+                source.name()
+            ),
+        });
+    }
+    if !native.dataset.get().await?.manifest.uses_stable_row_ids() {
+        return Err(Error::InvalidInput {
+            message: format!(
+                "materialized views require stable row ids on the source table; \
+                 create '{}' with storage option new_table_enable_stable_row_ids=true",
+                source.name()
+            ),
+        });
+    }
+    let source_schema = resolved.schema().await?;
+    let (definition, mut fields) =
+        plan(source_schema, resolved.name(), projections, filter, limit)?;
+    fields.push(ArrowField::new(
+        SOURCE_ROW_ID_COLUMN,
+        DataType::UInt64,
+        false,
+    ));
+    let metadata = HashMap::from([(
+        DEFINITION_META_KEY.to_string(),
+        definition_to_metadata(&definition)?,
+    )]);
+    Ok(PreparedDeclaration {
+        schema: Arc::new(ArrowSchema::new_with_metadata(fields, metadata)),
+        definition,
+        database,
+    })
+}
+
 /// One row of [`Connection::list_materialized_views`]: a view's name and its
 /// definition kind, which may be one this version cannot refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,64 +631,14 @@ impl CreateMaterializedViewBuilder {
     pub async fn execute(self) -> Result<MaterializedView> {
         ensure_local(&self.connection)?;
         let source = self.connection.open_table(&self.source).execute().await?;
-        let Some(native) = source.as_native() else {
-            return Err(Error::NotSupported {
-                message: "materialized views are supported only on local databases".into(),
-            });
-        };
-        if !native.dataset.get().await?.manifest.uses_stable_row_ids() {
-            return Err(Error::InvalidInput {
-                message: format!(
-                    "materialized views require stable row ids on the source table; \
-                     create '{}' with storage option new_table_enable_stable_row_ids=true",
-                    self.source
-                ),
-            });
-        }
-        let source_schema = source.schema().await?;
-        let (definition, mut fields) = plan(
-            source_schema,
-            &self.source,
+        let prepared = prepare_declaration(
+            &source,
             &self.projections,
             self.filter.as_deref(),
             self.limit,
-        )?;
-        fields.push(ArrowField::new(
-            SOURCE_ROW_ID_COLUMN,
-            DataType::UInt64,
-            false,
-        ));
-
-        let metadata = HashMap::from([(
-            DEFINITION_META_KEY.to_string(),
-            definition_to_metadata(&definition)?,
-        )]);
-        let schema = Arc::new(ArrowSchema::new_with_metadata(fields, metadata));
-        // Stable row ids so the view can itself source another view. The
-        // request-level option outranks any connection-level override; the
-        // manifest is still verified because another Database impl may
-        // ignore the option, but nothing is rolled back on failure.
-        let table = self
-            .connection
-            .create_empty_table(&self.name, schema)
-            .storage_option(OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS, "true")
-            .execute()
-            .await?;
-        let stable = match table.as_native() {
-            Some(native) => native.dataset.get().await?.manifest.uses_stable_row_ids(),
-            None => false,
-        };
-        if !stable {
-            return Err(Error::Runtime {
-                message: format!(
-                    "view '{}' was created without stable row ids: the database \
-                     ignored the creation option; the table remains and is not \
-                     usable as a materialized view",
-                    self.name
-                ),
-            });
-        }
-        Ok(MaterializedView { table, definition })
+        )
+        .await?;
+        prepared.create(&self.name).await
     }
 }
 
@@ -1062,5 +1212,98 @@ mod tests {
             .unwrap();
         conn.drop_table("v", &[]).await.unwrap();
         assert!(conn.list_materialized_views().await.unwrap().is_empty());
+    }
+
+    /// The public declaration contract: prepare validates the source and
+    /// create consumes the declaration into a verified view table; a
+    /// source that cannot anchor refresh and a target outside the
+    /// source's database are both refused.
+    #[tokio::test]
+    async fn prepare_and_create_bind_the_declaration_lifecycle() {
+        let conn = connect("memory://").execute().await.unwrap();
+        let batch = record_batch!(("id", Int32, [1, 2]), ("value", Int32, [3, 4])).unwrap();
+        let source = conn
+            .create_table("src", batch.clone())
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        let projections = [
+            ("id".to_string(), "id".to_string()),
+            ("double".to_string(), "value * 2".to_string()),
+        ];
+        let prepared = prepare_declaration(&source, &projections, Some("value > 0"), None)
+            .await
+            .unwrap();
+        assert_eq!(prepared.definition().source_table, "src");
+
+        let view = prepared.create("v").await.unwrap();
+        let schema = view.table().schema().await.unwrap();
+        let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
+        assert_eq!(names, ["id", "double", SOURCE_ROW_ID_COLUMN]);
+        assert!(schema.metadata().contains_key(DEFINITION_META_KEY));
+
+        // The same call rejects a source without stable row ids, so an
+        // external creation path cannot skip the check.
+        conn.create_table("plain", batch).execute().await.unwrap();
+        let plain = conn.open_table("plain").execute().await.unwrap();
+        let err = prepare_declaration(&plain, &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("stable row ids"), "{err}");
+
+        // A handle whose location does not resolve back through its name is
+        // refused: the definition would record a name reaching other data.
+        let plain_uri = plain
+            .as_native()
+            .unwrap()
+            .dataset
+            .get()
+            .await
+            .unwrap()
+            .uri()
+            .to_string();
+        let masquerade = conn
+            .open_table("src")
+            .location(plain_uri)
+            .execute()
+            .await
+            .unwrap();
+        let err = prepare_declaration(&masquerade, &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("does not resolve to itself"),
+            "{err}"
+        );
+
+        // A namespaced source cannot be recorded in the definition: the
+        // bare name refresh resolves would reach a different table or none.
+        let namespaced = crate::table::NativeTable::create(
+            "memory://ns_src",
+            "ns_src",
+            vec!["ns".to_string()],
+            Box::new(arrow_array::RecordBatchIterator::new(
+                vec![],
+                std::sync::Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+                    "id",
+                    arrow_schema::DataType::Int32,
+                    true,
+                )])),
+            )) as Box<dyn arrow_array::RecordBatchReader + Send>,
+            None,
+            None,
+            None,
+            None,
+            std::collections::HashSet::new(),
+        )
+        .await
+        .unwrap();
+        let namespaced = Table::new(std::sync::Arc::new(namespaced), conn.database().clone());
+        let err = prepare_declaration(&namespaced, &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("namespaced source"), "{err}");
     }
 }
