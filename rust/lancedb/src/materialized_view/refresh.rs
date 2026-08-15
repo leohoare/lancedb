@@ -38,6 +38,7 @@ use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
+use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::transaction::{Operation, Transaction};
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteDestination, WriteMode, WriteParams};
 use lance_core::ROW_ID;
@@ -140,12 +141,14 @@ pub(crate) async fn execute_refresh(
         }
     };
     let definition = &definition;
+    ensure_no_mem_wal(&view_ds, "materialized view", view.name()).await?;
 
     let source_ds = open_source(view, definition).await?;
     let source_ds = match pinned {
         Some(version) => source_ds.checkout_version(version).await?,
         None => source_ds,
     };
+    ensure_no_mem_wal(&source_ds, "source table", &definition.source_table).await?;
     let source_version = source_ds.version().version;
     let source_ts = source_ds.manifest.timestamp_nanos;
 
@@ -454,6 +457,26 @@ fn validate_inputs(source: &Dataset, definition: &MaterializedViewDefinition) ->
                 ),
             });
         }
+    }
+    Ok(())
+}
+
+/// Reject MemWAL/LSM state on a refresh participant: rows in un-compacted
+/// tiers are visible to ordinary reads but not to the fragment-planned
+/// refresh scan, so certifying either side would misrepresent the table.
+/// An active write spec and retained rows (the catch-up flag outlives
+/// unset) both disqualify.
+pub(crate) async fn ensure_no_mem_wal(dataset: &Dataset, role: &str, name: &str) -> Result<()> {
+    let retained = dataset.manifest.reader_feature_flags
+        & lance_table::feature_flags::FLAG_MEM_WAL_INDEX_CATCHUP
+        != 0;
+    if retained || dataset.mem_wal_index_details().await?.is_some() {
+        return Err(Error::NotSupported {
+            message: format!(
+                "{role} '{name}' has an LSM write spec or retained un-compacted \
+                 rows: rows in un-compacted tiers are invisible to refresh"
+            ),
+        });
     }
     Ok(())
 }
@@ -1509,5 +1532,96 @@ mod tests {
         let result = view.refresh().execute().await.unwrap();
         assert_eq!(result.rows_written, 2);
         assert_eq!(read(view.table(), "double value").await, vec![2, 4]);
+    }
+
+    /// MemWAL tiers are visible to reads but not to the refresh scan, so LSM
+    /// state disqualifies every participant: the source at create, either
+    /// side at refresh, and the view can never accept a spec. Retained
+    /// un-compacted rows (the catch-up flag outlives unset) count as state.
+    #[tokio::test]
+    async fn lsm_state_disqualifies_source_and_view() {
+        use crate::table::LsmWriteSpec;
+        use arrow_array::RecordBatchIterator;
+
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let conn = connect(tmp_dir.path().to_str().unwrap())
+            .execute()
+            .await
+            .unwrap();
+        // Hand-rolled: the LSM primary key must be non-nullable, which
+        // record_batch! cannot express.
+        let schema = Arc::new(ArrowSchema::new(vec![
+            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false),
+            arrow_schema::Field::new("x", arrow_schema::DataType::Int32, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::Int64Array::from(vec![1, 2])) as _,
+                Arc::new(Int32Array::from(vec![1, 2])) as _,
+            ],
+        )
+        .unwrap();
+        let table = conn
+            .create_table("src", batch.clone())
+            .write_options(crate::materialized_view::tests::stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+        table.set_unenforced_primary_key(["id"]).await.unwrap();
+        table
+            .set_lsm_write_spec(LsmWriteSpec::unsharded())
+            .await
+            .unwrap();
+
+        // An active-LSM source is refused at create.
+        let err = conn
+            .create_materialized_view("v", "src")
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("un-compacted"), "{err}");
+
+        // Unset with nothing written clears the state: the view creates,
+        // and a spec can never be installed over it.
+        table.unset_lsm_write_spec().await.unwrap();
+        let view = conn
+            .create_materialized_view("v", "src")
+            .execute()
+            .await
+            .unwrap();
+        let err = view
+            .table()
+            .set_lsm_write_spec(LsmWriteSpec::unsharded())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("materialized view"), "{err}");
+
+        // A source that acquires a spec after create fails refresh.
+        table
+            .set_lsm_write_spec(LsmWriteSpec::unsharded())
+            .await
+            .unwrap();
+        let err = view.refresh().execute().await.unwrap_err();
+        assert!(err.to_string().contains("source table 'src'"), "{err}");
+
+        // Retained rows outlive unset: write through the WAL, unset, and
+        // refresh still refuses on the catch-up flag.
+        table.require_mem_wal_index_catchup().await.unwrap();
+        let mut merge = table.merge_insert(&["id"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all()
+            .use_lsm(true);
+        merge
+            .execute(Box::new(RecordBatchIterator::new(
+                vec![Ok(batch.clone())],
+                batch.schema(),
+            )))
+            .await
+            .unwrap();
+        table.unset_lsm_write_spec().await.unwrap();
+        let err = view.refresh().execute().await.unwrap_err();
+        assert!(err.to_string().contains("source table 'src'"), "{err}");
     }
 }
