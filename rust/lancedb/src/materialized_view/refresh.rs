@@ -22,9 +22,22 @@
 //! and the next refresh rebuilds rather than trusting any of it.
 //!
 //! Refreshes of one view are serialized within a process by a per-view lock.
-//! Across processes nothing serializes them, and two incremental refreshes
-//! planned at the same watermark would each append the same rows; run one
-//! process's refreshes against a view at a time.
+//! Across processes nothing serializes them: two incremental refreshes
+//! planned at the same watermark each append the same rows, and both
+//! appends become durable. The version check that follows a write cannot
+//! prevent this -- lance rebases a conflicting append rather than rejecting
+//! it, so the loser's rows land and only then does it report an abort. Its
+//! error says the refresh is "unrecorded", which is true of the watermark
+//! and false of the rows: the view serves duplicates until something
+//! rebuilds it.
+//!
+//! Closing this needs the data and the watermark to commit as one
+//! transaction, which no current lance operation expresses (`Append` and
+//! `Update` carry fragments, `UpdateConfig` carries schema metadata, and
+//! `Overwrite` -- which carries config -- rebases over concurrent metadata
+//! commits). Until then, run one process's refreshes against a view at a
+//! time. `differential::concurrent_refreshes_hold_each_row_once` is the
+//! reproducer.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
