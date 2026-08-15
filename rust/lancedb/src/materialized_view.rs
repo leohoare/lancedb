@@ -7,7 +7,7 @@
 //! over one source table -- projected expressions, an optional filter, an
 //! optional row limit -- and maintained by refresh rather than by writes.
 //! Creating one commits an empty table carrying the definition in schema
-//! metadata; [`MaterializedView::refresh`] computes the rows. The source
+//! metadata; a later refresh computes the rows. The source
 //! table must have stable row ids ([`CreateMaterializedViewBuilder::execute`]
 //! says why).
 //!
@@ -1277,6 +1277,24 @@ mod tests {
             err.to_string().contains("does not resolve to itself"),
             "{err}"
         );
+
+        // A table created at a custom location is refused outright: its
+        // recorded name reaches nothing at the database root, so the
+        // canonical reopen fails before any URI comparison.
+        let custom = conn
+            .create_table(
+                "custom_loc",
+                record_batch!(("id", Int32, [1, 2]), ("value", Int32, [3, 4])).unwrap(),
+            )
+            .location("memory://elsewhere/custom_loc")
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+        let err = prepare_declaration(&custom, &[], None, None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("custom_loc"), "{err}");
 
         // A namespaced source cannot be recorded in the definition: the
         // bare name refresh resolves would reach a different table or none.
