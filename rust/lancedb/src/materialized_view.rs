@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use datafusion_common::ScalarValue;
 use lance_core::ROW_ID;
 use lance_datafusion::planner::Planner;
 use serde::{Deserialize, Serialize};
@@ -51,6 +52,17 @@ pub const REFRESHED_AT_MS_META_KEY: &str = "mv.refreshed_at_ms";
 /// source compactions, updates and deletes -- which is why a view's source
 /// is required to keep stable row ids.
 pub const SOURCE_ROW_ID_COLUMN: &str = "__source_row_id";
+
+/// Field metadata namespace for declarations about schema structure, such as
+/// an unenforced primary key.
+const SCHEMA_DECLARATION_META_PREFIX: &str = "lance-schema:";
+
+/// A field's identity in its own schema, which is not the view's.
+const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
+
+/// Schema metadata key holding embedding-function configuration. It describes
+/// columns rather than storage, so a view carries it through.
+const EMBEDDING_FUNCTIONS_META_KEY: &str = "embedding_functions";
 
 /// Value of the definition's `kind` tag for the projected `select` form.
 pub const SELECT_KIND: &str = "select";
@@ -153,7 +165,11 @@ pub(crate) fn plan(
     projections: &[(String, String)],
     filter: Option<&str>,
     limit: Option<u64>,
-) -> Result<(MaterializedViewDefinition, Vec<ArrowField>)> {
+) -> Result<(
+    MaterializedViewDefinition,
+    Vec<ArrowField>,
+    HashMap<String, String>,
+)> {
     let projections: Vec<(String, String)> = if projections.is_empty() {
         source_schema
             .fields()
@@ -167,10 +183,21 @@ pub(crate) fn plan(
         projections.to_vec()
     };
 
+    // A scan takes the cap as i64. Rejecting it here keeps creation and
+    // refresh from disagreeing about whether a view is valid.
+    if let Some(limit) = limit
+        && i64::try_from(limit).is_err()
+    {
+        return Err(Error::InvalidInput {
+            message: format!("view limit {limit} exceeds the maximum of {}", i64::MAX),
+        });
+    }
+
     let planner = Planner::new(source_schema.clone());
     let mut fields = Vec::with_capacity(projections.len());
     let mut inputs = Vec::new();
     let mut declared: Vec<&str> = Vec::with_capacity(projections.len());
+    let mut renames: HashMap<String, String> = HashMap::new();
 
     for (output, expression) in &projections {
         if declared.contains(&output.as_str()) {
@@ -228,7 +255,21 @@ pub(crate) fn plan(
 
         // Always nullable: what a refresh appends must fit the declared field
         // whatever nullability the evaluator reports for a given batch.
-        fields.push(ArrowField::new(output, data_type, true));
+        let mut field = ArrowField::new(output, data_type, true);
+        // A column projected as itself keeps its field metadata, which is what
+        // marks blob columns and the like; anything computed is a new value
+        // and carries none. Structural declarations do not come along: they
+        // constrain how a table is written, and a view's fields are always
+        // nullable, which an unenforced primary key forbids.
+        if let Some(source_field) = projected_field(&expr, &source_schema) {
+            field = field.with_metadata(source_field.metadata().clone());
+        }
+        if let Some(path) = projected_path(&expr)
+            && let [column] = path.as_slice()
+        {
+            renames.insert(column.clone(), output.clone());
+        }
+        fields.push(without_declarations(&field));
         inputs.extend(expr_inputs);
         declared.push(output);
     }
@@ -277,7 +318,7 @@ pub(crate) fn plan(
         limit,
         inputs,
     };
-    Ok((definition, fields))
+    Ok((definition, fields, renames))
 }
 
 /// Reject any function that is not immutable: a view definition has to
@@ -324,6 +365,138 @@ fn root(path: &str) -> &str {
 
 /// The columns `expr` reads, kept as the planner reports them (a nested
 /// reference stays a dotted path) but resolved by root field.
+/// Embedding configuration rewritten for the view: entries whose columns the
+/// view projects directly are kept and renamed to the view's own names, and
+/// the rest are dropped. A configuration naming a column the view does not
+/// carry, or carries under another name, describes a table that does not
+/// exist.
+fn embedding_config_for_view(raw: &str, renames: &HashMap<String, String>) -> Option<String> {
+    // Every representation the writers use: the Python bindings name the
+    // destination `vector_column`, the Rust definition `dest_column`, and the
+    // Node bindings spell both halves in camelCase.
+    const SOURCE_KEYS: [&str; 2] = ["source_column", "sourceColumn"];
+    const DEST_KEYS: [&str; 4] = ["vector_column", "dest_column", "vectorColumn", "destColumn"];
+
+    let mut entries: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+    entries.retain_mut(|entry| {
+        let Some(object) = entry.as_object_mut() else {
+            return false;
+        };
+        let Some(source_key) = SOURCE_KEYS.iter().find(|key| object.contains_key(**key)) else {
+            return false;
+        };
+        let Some(source) = object
+            .get(*source_key)
+            .and_then(|v| v.as_str())
+            .and_then(|name| renames.get(name))
+            .cloned()
+        else {
+            return false;
+        };
+        let Some(dest_key) = DEST_KEYS.iter().find(|key| object.contains_key(**key)) else {
+            return false;
+        };
+        let Some(dest) = object
+            .get(*dest_key)
+            .and_then(|v| v.as_str())
+            .and_then(|name| renames.get(name))
+            .cloned()
+        else {
+            return false;
+        };
+        object.insert((*source_key).to_string(), serde_json::Value::String(source));
+        object.insert((*dest_key).to_string(), serde_json::Value::String(dest));
+        true
+    });
+    (!entries.is_empty()).then(|| serde_json::Value::Array(entries).to_string())
+}
+
+/// The source field a projection reads directly, if it reads one: a bare
+/// column, or a path of struct field accesses over one. Anything computed
+/// produces a new value and has no source field.
+fn projected_field<'a>(
+    expr: &datafusion_expr::Expr,
+    schema: &'a ArrowSchema,
+) -> Option<&'a ArrowField> {
+    let path = projected_path(expr)?;
+    let mut segments = path.iter();
+    let mut field = schema.field_with_name(segments.next()?).ok()?;
+    for segment in segments {
+        let DataType::Struct(children) = field.data_type() else {
+            return None;
+        };
+        field = children.iter().find(|c| c.name() == segment)?;
+    }
+    Some(field)
+}
+
+/// The dotted path a projection reads directly, root first.
+fn projected_path(expr: &datafusion_expr::Expr) -> Option<Vec<String>> {
+    let mut path = Vec::new();
+    let mut node = expr;
+    loop {
+        match node {
+            datafusion_expr::Expr::Column(column) => {
+                path.push(column.name.clone());
+                break;
+            }
+            // `a.b` parses to get_field(a, "b"), nested for deeper paths.
+            datafusion_expr::Expr::ScalarFunction(call) if call.func.name() == "get_field" => {
+                let [
+                    inner,
+                    datafusion_expr::Expr::Literal(ScalarValue::Utf8(Some(name)), _),
+                ] = call.args.as_slice()
+                else {
+                    return None;
+                };
+                path.push(name.clone());
+                node = inner;
+            }
+            _ => return None,
+        }
+    }
+
+    path.reverse();
+    Some(path)
+}
+
+/// `field` without the metadata that declares how a column is written or
+/// maintained, at every depth. Descriptive metadata -- what marks a blob, for
+/// instance -- stays. A view's rows come from refresh alone, so carrying a
+/// declaration into one either contradicts it (its fields are always
+/// nullable, which an unenforced primary key forbids) or is rejected outright
+/// as a foreign declaration. A declaration buried in a struct child binds as
+/// hard as one on top.
+fn is_declaration(key: &str) -> bool {
+    key.starts_with(SCHEMA_DECLARATION_META_PREFIX)
+        || key == LANCE_FIELD_ID_KEY
+        || crate::table::computed_columns::is_declaration_key(key)
+}
+
+fn without_declarations(field: &ArrowField) -> ArrowField {
+    let metadata: HashMap<String, String> = field
+        .metadata()
+        .iter()
+        .filter(|(key, _)| !is_declaration(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect();
+    let data_type = match field.data_type() {
+        DataType::Struct(children) => DataType::Struct(
+            children
+                .iter()
+                .map(|c| Arc::new(without_declarations(c)))
+                .collect(),
+        ),
+        DataType::List(child) => DataType::List(Arc::new(without_declarations(child))),
+        DataType::LargeList(child) => DataType::LargeList(Arc::new(without_declarations(child))),
+        DataType::FixedSizeList(child, len) => {
+            DataType::FixedSizeList(Arc::new(without_declarations(child)), *len)
+        }
+        other => other.clone(),
+    };
+    ArrowField::new(field.name(), data_type, field.is_nullable()).with_metadata(metadata)
+}
+
 fn resolve_inputs(
     schema: &ArrowSchema,
     expr: &datafusion_expr::Expr,
@@ -533,17 +706,28 @@ pub async fn prepare_declaration(
         });
     }
     let source_schema = resolved.schema().await?;
-    let (definition, mut fields) =
+    let source_metadata = source_schema.metadata().clone();
+    let (definition, mut fields, renames) =
         plan(source_schema, resolved.name(), projections, filter, limit)?;
     fields.push(ArrowField::new(
         SOURCE_ROW_ID_COLUMN,
         DataType::UInt64,
         false,
     ));
-    let metadata = HashMap::from([(
+    // Only metadata that describes the columns comes along. Structural
+    // declarations -- an unenforced primary key, an LSM write spec -- describe
+    // how a table is written, and a view is written by refresh alone; carrying
+    // them would also declare a key over the view's always-nullable fields.
+    let mut metadata: HashMap<String, String> = HashMap::new();
+    if let Some(raw) = source_metadata.get(EMBEDDING_FUNCTIONS_META_KEY)
+        && let Some(rewritten) = embedding_config_for_view(raw, &renames)
+    {
+        metadata.insert(EMBEDDING_FUNCTIONS_META_KEY.to_string(), rewritten);
+    }
+    metadata.insert(
         DEFINITION_META_KEY.to_string(),
         definition_to_metadata(&definition)?,
-    )]);
+    );
     Ok(PreparedDeclaration {
         schema: Arc::new(ArrowSchema::new_with_metadata(fields, metadata)),
         definition,
@@ -684,6 +868,7 @@ impl MaterializedView {
         &self.table
     }
 
+    /// The view's table name.
     pub fn name(&self) -> &str {
         self.table.name()
     }
@@ -1208,6 +1393,327 @@ mod tests {
                 "{filter} was not rejected"
             );
         }
+    }
+
+    /// A column projected as itself stays the column it was: blob discovery
+    /// and the blob APIs key off field metadata, which a bare rebuild of the
+    /// field would drop.
+    #[tokio::test]
+    async fn test_identity_projection_keeps_field_metadata() {
+        let conn = connect("memory://").execute().await.unwrap();
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![
+                ArrowField::new("id", DataType::Int32, true),
+                crate::blob("payload", true),
+            ],
+            HashMap::new(),
+        ));
+        conn.create_empty_table("src", schema)
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        let view = conn
+            .create_materialized_view("v", "src")
+            .execute()
+            .await
+            .unwrap();
+        let view_schema = view.table().schema().await.unwrap();
+
+        let payload = view_schema.field_with_name("payload").unwrap();
+        assert!(
+            crate::blob::is_blob(payload),
+            "default projection dropped the blob marker: {:?}",
+            payload.metadata()
+        );
+        assert_eq!(
+            view.table().blob_columns().await.unwrap(),
+            vec!["payload".to_string()],
+            "blob discovery no longer finds the projected column"
+        );
+        assert!(view_schema.metadata().contains_key(DEFINITION_META_KEY));
+        // Structural declarations describe how a table is written; a view is
+        // written by refresh, and its fields are always nullable.
+        assert!(!view_schema.metadata().contains_key("lance:primary_key"));
+
+        // A computed column is a new value and carries no source metadata.
+        let computed = conn
+            .create_materialized_view("c", "src")
+            .select([("payload", "payload"), ("n", "id + 1")])
+            .execute()
+            .await
+            .unwrap();
+        let computed_schema = computed.table().schema().await.unwrap();
+        assert!(crate::blob::is_blob(
+            computed_schema.field_with_name("payload").unwrap()
+        ));
+        assert!(
+            computed_schema
+                .field_with_name("n")
+                .unwrap()
+                .metadata()
+                .is_empty()
+        );
+    }
+
+    /// A nested column projected straight through is still that column, and a
+    /// declaration buried in a struct child binds as hard as one on top.
+    #[tokio::test]
+    async fn test_nested_projection_metadata_and_declarations() {
+        let conn = connect("memory://").execute().await.unwrap();
+        let payload = crate::blob("payload", true).with_metadata(HashMap::from([
+            ("lance-encoding:blob".to_string(), "true".to_string()),
+            (
+                "lance-schema:unenforced-primary-key".to_string(),
+                "0".to_string(),
+            ),
+        ]));
+        let schema = Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("meta", DataType::Struct(vec![payload].into()), true),
+        ]));
+        conn.create_empty_table("src", schema)
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        // A nested path is a direct projection: the leaf's metadata comes with
+        // it, so the blob stays a blob rather than a plain struct.
+        let lifted = conn
+            .create_materialized_view("lifted", "src")
+            .select([("payload", "meta.payload")])
+            .execute()
+            .await
+            .unwrap();
+        let field = lifted.table().schema().await.unwrap();
+        let field = field.field_with_name("payload").unwrap().clone();
+        assert_eq!(
+            field.metadata().get("lance-encoding:blob"),
+            Some(&"true".to_string()),
+            "nested projection lost the leaf's metadata"
+        );
+        assert!(
+            !field
+                .metadata()
+                .contains_key("lance-schema:unenforced-primary-key"),
+            "a structural declaration rode along"
+        );
+
+        // Projecting the struct whole must not carry the child's declaration
+        // out to a view whose fields are nullable.
+        let whole = conn
+            .create_materialized_view("whole", "src")
+            .select([("meta", "meta")])
+            .execute()
+            .await
+            .unwrap();
+        let schema = whole.table().schema().await.unwrap();
+        let DataType::Struct(children) = schema.field_with_name("meta").unwrap().data_type() else {
+            panic!("meta is not a struct");
+        };
+        let child = children.iter().find(|c| c.name() == "payload").unwrap();
+        assert!(
+            !child
+                .metadata()
+                .contains_key("lance-schema:unenforced-primary-key"),
+            "a nested declaration survived: {:?}",
+            child.metadata()
+        );
+        assert_eq!(
+            child.metadata().get("lance-encoding:blob"),
+            Some(&"true".to_string())
+        );
+    }
+
+    /// A computed column is declared by field metadata. Projecting one --
+    /// as itself or under an alias -- must carry its description without its
+    /// declaration, which the target table would reject as foreign.
+    #[tokio::test]
+    async fn test_view_over_a_computed_column() {
+        let conn = connect("memory://").execute().await.unwrap();
+        let batch = record_batch!(("id", Int32, [1, 2])).unwrap();
+        let source = conn
+            .create_table("src", batch)
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+        source
+            .add_columns()
+            .computed("doubled", "id * 2")
+            .execute()
+            .await
+            .unwrap();
+
+        // Default projection reaches the computed column too.
+        let whole = conn
+            .create_materialized_view("whole", "src")
+            .execute()
+            .await
+            .unwrap();
+        let schema = whole.table().schema().await.unwrap();
+        let field = schema.field_with_name("doubled").unwrap();
+        assert!(
+            !field
+                .metadata()
+                .keys()
+                .any(|k| k.starts_with("computed_column")),
+            "a computed-column declaration rode along: {:?}",
+            field.metadata()
+        );
+
+        // And under an alias.
+        conn.create_materialized_view("aliased", "src")
+            .select([("twice", "doubled")])
+            .execute()
+            .await
+            .unwrap();
+    }
+
+    /// Embedding configuration names columns. It comes along only for the
+    /// columns a view actually projects, under the names the view gives them.
+    #[tokio::test]
+    async fn test_embedding_config_follows_the_projection() {
+        let config = r#"[{"name":"f","model":{},"source_column":"text","vector_column":"vec"}]"#;
+        let conn = connect("memory://").execute().await.unwrap();
+        let schema = Arc::new(ArrowSchema::new_with_metadata(
+            vec![
+                ArrowField::new("text", DataType::Utf8, true),
+                ArrowField::new("vec", DataType::Float32, true),
+            ],
+            HashMap::from([("embedding_functions".to_string(), config.to_string())]),
+        ));
+        conn.create_empty_table("src", schema)
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        let carried = |view: &MaterializedView| {
+            let view = view.table().clone();
+            async move {
+                view.schema()
+                    .await
+                    .unwrap()
+                    .metadata()
+                    .get("embedding_functions")
+                    .cloned()
+            }
+        };
+
+        // Both columns projected as themselves: kept as it stands.
+        let whole = conn
+            .create_materialized_view("whole", "src")
+            .execute()
+            .await
+            .unwrap();
+        let kept = carried(&whole).await.expect("config dropped");
+        assert!(kept.contains(r#""source_column":"text""#), "{kept}");
+        assert!(kept.contains(r#""vector_column":"vec""#), "{kept}");
+
+        // Only the source column: the configuration names a vector column the
+        // view does not have, so it describes nothing and goes.
+        let partial = conn
+            .create_materialized_view("partial", "src")
+            .select([("text", "text")])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(carried(&partial).await, None);
+
+        // Renamed: the configuration follows the names the view uses.
+        let renamed = conn
+            .create_materialized_view("renamed", "src")
+            .select([("body", "text"), ("embedding", "vec")])
+            .execute()
+            .await
+            .unwrap();
+        let remapped = carried(&renamed).await.expect("config dropped");
+        assert!(remapped.contains(r#""source_column":"body""#), "{remapped}");
+        assert!(
+            remapped.contains(r#""vector_column":"embedding""#),
+            "{remapped}"
+        );
+
+        // The Node bindings spell the same configuration in camelCase, and
+        // the Rust definition names the destination `dest_column`.
+        for (config, source_key, dest_key) in [
+            (
+                r#"[{"name":"f","model":{},"sourceColumn":"text","vectorColumn":"vec"}]"#,
+                "sourceColumn",
+                "vectorColumn",
+            ),
+            (
+                r#"[{"name":"f","model":{},"source_column":"text","dest_column":"vec"}]"#,
+                "source_column",
+                "dest_column",
+            ),
+        ] {
+            let schema = Arc::new(ArrowSchema::new_with_metadata(
+                vec![
+                    ArrowField::new("text", DataType::Utf8, true),
+                    ArrowField::new("vec", DataType::Float32, true),
+                ],
+                HashMap::from([("embedding_functions".to_string(), config.to_string())]),
+            ));
+            let name = format!("src_{source_key}");
+            conn.create_empty_table(&name, schema)
+                .write_options(stable_row_ids())
+                .execute()
+                .await
+                .unwrap();
+            let view = conn
+                .create_materialized_view(format!("v_{source_key}"), &name)
+                .select([("body", "text"), ("embedding", "vec")])
+                .execute()
+                .await
+                .unwrap();
+            let carried = carried(&view).await.expect("config dropped");
+            assert!(
+                carried.contains(&format!(r#""{source_key}":"body""#)),
+                "{carried}"
+            );
+            assert!(
+                carried.contains(&format!(r#""{dest_key}":"embedding""#)),
+                "{carried}"
+            );
+        }
+
+        // A computed column is not the source column under another name.
+        let computed = conn
+            .create_materialized_view("computed", "src")
+            .select([("body", "upper(text)"), ("embedding", "vec")])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(carried(&computed).await, None);
+    }
+
+    /// A scan takes the cap as i64, so a larger one is refused where it is
+    /// declared rather than at the refresh that cannot run it. What a cap of
+    /// zero means is a refresh question, tested there.
+    #[tokio::test]
+    async fn test_limit_above_i64_max_is_refused_at_creation() {
+        let conn = people_db().await;
+        let err = conn
+            .create_materialized_view("too_big", "people")
+            .limit(i64::MAX as u64 + 1)
+            .execute()
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidInput { message } if message.contains("exceeds the maximum")),
+            "got {err:?}"
+        );
+
+        // The boundary itself is accepted.
+        conn.create_materialized_view("at_max", "people")
+            .limit(i64::MAX as u64)
+            .execute()
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
