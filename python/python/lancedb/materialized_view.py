@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 DEFINITION_META_KEY = b"mv.definition"
 
 SelectArg = Union[
+    str,
     Sequence[Union[str, Tuple[str, str]]],
     Dict[str, str],
     None,
@@ -78,9 +79,13 @@ def normalize_select(select: SelectArg) -> Optional[List[Tuple[str, str]]]:
     """``select`` items may be a column name, an ``(alias, expression)`` pair,
     or a dict of the same. A bare name projects itself and is quoted, so any
     valid column name works; dict and pair entries are kept verbatim because
-    their right side is an expression."""
+    their right side is an expression.
+
+    A lone string is one column, not a sequence of its characters."""
     if select is None:
         return None
+    if isinstance(select, str):
+        select = [select]
     if isinstance(select, dict):
         return list(select.items())
     normalized = []
