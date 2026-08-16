@@ -171,7 +171,7 @@ pub(crate) async fn execute_refresh(
         .map(|p| (p.output.clone(), p.expression.clone()))
         .collect();
     validate_inputs(&source_ds, definition)?;
-    let (replanned, mut planned_fields) = super::plan(
+    let (replanned, mut planned_fields, _renames) = super::plan(
         source_schema,
         &definition.source_table,
         &projections,
@@ -983,8 +983,19 @@ async fn compute_stream(
         .map(|p| (p.output.as_str(), p.expression.as_str()))
         .collect();
     scanner.project_with_transform(&transforms)?;
+    // A scan reads a limit of zero as no limit at all, so a view capped at
+    // nothing is answered without one.
+    if limit == Some(0) {
+        return Ok(Box::pin(RecordBatchStreamAdapter::new(
+            schema.clone(),
+            futures::stream::empty(),
+        )));
+    }
     if let Some(limit) = limit {
-        scanner.limit(Some(limit as i64), None)?;
+        let limit = i64::try_from(limit).map_err(|_| Error::InvalidInput {
+            message: format!("view limit {limit} exceeds the maximum of {}", i64::MAX),
+        })?;
+        scanner.limit(Some(limit), None)?;
     }
 
     let out_schema = schema.clone();
@@ -1520,6 +1531,32 @@ mod tests {
         refreshing.await.unwrap().unwrap();
         let after = conn.open_table("atomic_view").execute().await.unwrap();
         assert_eq!(read(&after, "twice").await, vec![22, 24, 26]);
+    }
+
+    /// A cap of zero is a view that holds nothing, not a view without a cap.
+    #[tokio::test]
+    async fn test_zero_limit_holds_no_rows() {
+        let (conn, source) = db_with_source(vec![1, 2, 3]).await;
+        let view = conn
+            .create_materialized_view("empty", "src")
+            .select([("x", "x")])
+            .limit(0)
+            .execute()
+            .await
+            .unwrap();
+
+        let result = view.refresh().execute().await.unwrap();
+        assert_eq!(result.rows_written, 0);
+        assert_eq!(view.table().count_rows(None).await.unwrap(), 0);
+
+        // Still nothing after the source grows, and the watermark advances.
+        append(&source, vec![4]).await;
+        view.refresh().execute().await.unwrap();
+        assert_eq!(view.table().count_rows(None).await.unwrap(), 0);
+        assert_eq!(
+            view.refresh().execute().await.unwrap().mode,
+            RefreshMode::NoOp
+        );
     }
 
     async fn compact(source: &Table) {
