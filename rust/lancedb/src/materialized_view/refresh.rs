@@ -584,6 +584,9 @@ async fn incremental(
     // rebuild.
     let mut evicted_view: Option<Dataset> = None;
     let mut updated_ids: Vec<u64> = Vec::new();
+    // The view generation this refresh plans from. Every commit it makes must
+    // land on the next one, or something it cannot account for interleaved.
+    let generation = &mut view_ds.version().version;
     if (increment.evict_deleted || increment.replace_updated)
         && let Some(watermark) = watermark
     {
@@ -593,11 +596,13 @@ async fn incremental(
             .with_end_version(source_version)
             .build()?;
         let mut view = view_ds.clone();
+        #[cfg(test)]
+        tests::hold_before_eviction(view.uri()).await;
         let mut evicted = false;
         if increment.evict_deleted {
             let mut stream = delta.get_deleted_row_ids().await?;
             while let Some(batch) = stream.try_next().await? {
-                evicted |= evict_by_provenance(&mut view, &row_ids_of(&batch)?).await?;
+                evicted |= evict_by_provenance(&mut view, &row_ids_of(&batch)?, generation).await?;
             }
         }
         if increment.replace_updated {
@@ -607,7 +612,7 @@ async fn incremental(
             }
             // Their current values are recomputed below and appended, so the
             // rows the view holds for them go now.
-            evicted |= evict_by_provenance(&mut view, &updated_ids).await?;
+            evicted |= evict_by_provenance(&mut view, &updated_ids, generation).await?;
         }
         if evicted {
             view_native.dataset.update(view.clone());
@@ -642,6 +647,9 @@ async fn incremental(
     // follow-up commit (see the module docs for the crash window).
     let schema = Arc::new(ArrowSchema::from(view_ds.schema()));
     let rows_written = Arc::new(AtomicU64::new(0));
+    // compute_stream counts what it produces; the truncation below can drop
+    // some of that, so the written count comes from the tee instead.
+    let computed = Arc::new(AtomicU64::new(0));
     let mut stream = compute_stream(
         source_ds,
         definition,
@@ -656,7 +664,7 @@ async fn incremental(
             ..Default::default()
         },
         schema.clone(),
-        rows_written.clone(),
+        computed.clone(),
     )
     .await?;
 
@@ -668,16 +676,22 @@ async fn incremental(
             definition,
             RowScope {
                 row_ids: Some(&updated_ids),
+                limit: remaining,
                 ..Default::default()
             },
             schema.clone(),
-            rows_written.clone(),
+            computed.clone(),
         )
         .await?;
         stream = Box::pin(RecordBatchStreamAdapter::new(
             schema.clone(),
-            stream.chain(recomputed),
+            recomputed.chain(stream),
         ));
+    }
+    // New and recomputed rows compete for one budget: capping each stream
+    // separately lets their sum exceed the view's cap.
+    if let Some(remaining) = remaining {
+        stream = take_rows(stream, remaining);
     }
 
     // Nothing survived the filter: the watermark still has to advance or the
@@ -699,7 +713,7 @@ async fn incremental(
     let keys = Arc::new(StdMutex::new(KeyExistenceFilterBuilder::new(vec![
         source_row_id_field_id(view_ds)?,
     ])));
-    let stream = collect_source_row_ids(stream, keys.clone());
+    let stream = collect_source_row_ids(stream, keys.clone(), rows_written.clone());
 
     let ds = Arc::new(view_ds.clone());
     let write_txn = InsertBuilder::new(WriteDestination::Dataset(ds.clone()))
@@ -725,7 +739,7 @@ async fn incremental(
         .build();
     let appended = CommitBuilder::new(WriteDestination::Dataset(ds))
         .execute(Transaction::new(
-            view_ds.version().version,
+            *generation,
             Operation::Update {
                 removed_fragment_ids: Vec::new(),
                 updated_fragments: Vec::new(),
@@ -740,6 +754,18 @@ async fn incremental(
             None,
         ))
         .await?;
+    // Lance rejects an append whose provenance keys overlap a concurrent one,
+    // but an unrelated write to the view is not a key conflict, so the
+    // generation is checked here as well as at eviction.
+    if appended.version().version != *generation + 1 {
+        return Err(Error::Runtime {
+            message: format!(
+                "a concurrent commit raced this refresh (view version {}); \
+                 the refresh is unrecorded and the next one will rebuild",
+                appended.version().version
+            ),
+        });
+    }
     result.rows_written = rows_written.load(Ordering::Relaxed);
     result.version = stamp_watermark(view_native, appended, source_version, source_ts).await?;
     Ok(result)
@@ -1013,7 +1039,11 @@ fn row_ids_of(batch: &RecordBatch) -> Result<Vec<u64>> {
 /// Drop the view rows carrying `ids`, one bounded statement at a time.
 /// Repeating a chunk is harmless, so a refresh that fails partway leaves the
 /// next one the same work.
-async fn evict_by_provenance(view: &mut Dataset, ids: &[u64]) -> Result<bool> {
+async fn evict_by_provenance(
+    view: &mut Dataset,
+    ids: &[u64],
+    generation: &mut u64,
+) -> Result<bool> {
     for chunk in ids.chunks(EVICTION_CHUNK) {
         let predicate = format!(
             "{SOURCE_ROW_ID_COLUMN} IN ({})",
@@ -1024,8 +1054,43 @@ async fn evict_by_provenance(view: &mut Dataset, ids: &[u64]) -> Result<bool> {
                 .join(", ")
         );
         view.delete(&predicate).await?;
+        *generation += 1;
+        // An eviction that did not land on the generation it planned from has
+        // been interleaved with a write this refresh cannot account for, and
+        // certifying it would stamp that drift as materialized.
+        if view.version().version != *generation {
+            return Err(Error::Runtime {
+                message: format!(
+                    "a concurrent commit raced this refresh (view version {}); \
+                     the refresh is unrecorded and the next one will rebuild",
+                    view.version().version
+                ),
+            });
+        }
     }
     Ok(!ids.is_empty())
+}
+
+/// Cap a stream at `limit` rows, slicing the batch that crosses the boundary.
+fn take_rows(stream: SendableRecordBatchStream, limit: u64) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let capped = stream.scan(0u64, move |taken, batch| {
+        let out = batch.map(|batch| {
+            let room = limit.saturating_sub(*taken) as usize;
+            let batch = if batch.num_rows() > room {
+                batch.slice(0, room)
+            } else {
+                batch
+            };
+            *taken += batch.num_rows() as u64;
+            batch
+        });
+        std::future::ready(match &out {
+            Ok(batch) if batch.num_rows() == 0 => None,
+            _ => Some(out),
+        })
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, capped))
 }
 
 fn source_row_id_field_id(view_ds: &Dataset) -> Result<i32> {
@@ -1042,6 +1107,7 @@ fn source_row_id_field_id(view_ds: &Dataset) -> Result<i32> {
 fn collect_source_row_ids(
     stream: SendableRecordBatchStream,
     keys: Arc<StdMutex<KeyExistenceFilterBuilder>>,
+    written: Arc<AtomicU64>,
 ) -> SendableRecordBatchStream {
     let schema = stream.schema();
     let mapped = stream.map(move |batch| {
@@ -1064,6 +1130,7 @@ fn collect_source_row_ids(
             keys.insert(KeyValue::UInt64(*id))
                 .map_err(|e| DataFusionError::Internal(e.to_string()))?;
         }
+        written.fetch_add(batch.num_rows() as u64, Ordering::Relaxed);
         Ok(batch)
     });
     Box::pin(RecordBatchStreamAdapter::new(schema, mapped))
@@ -1071,6 +1138,26 @@ fn collect_source_row_ids(
 
 #[cfg(test)]
 mod tests {
+
+    /// Park a refresh between planning and eviction so a test can move the
+    /// view underneath it. Inert unless [`DRIFT_TARGET`] names this view.
+    pub(super) async fn hold_before_eviction(uri: &str) {
+        {
+            let mut target = DRIFT_TARGET.lock().unwrap();
+            if target.as_deref() != Some(uri) {
+                return;
+            }
+            // Take it: memory:// uris are relative and repeat across tests, so
+            // leaving it armed would park an unrelated refresh forever.
+            *target = None;
+        }
+        DRIFT_PLANNED.notify_one();
+        DRIFT_RELEASED.notified().await;
+    }
+
+    pub(super) static DRIFT_TARGET: StdMutex<Option<String>> = StdMutex::new(None);
+    pub(super) static DRIFT_PLANNED: tokio::sync::Notify = tokio::sync::Notify::const_new();
+    pub(super) static DRIFT_RELEASED: tokio::sync::Notify = tokio::sync::Notify::const_new();
     use arrow_array::{Int32Array, record_batch};
     use futures::TryStreamExt;
     use lance::dataset::NewColumnTransform;
@@ -1292,6 +1379,64 @@ mod tests {
         assert_eq!(read(view.table(), "twice").await, vec![2, 6]);
     }
 
+    /// A refresh may only certify the generation it planned from. A write
+    /// that lands between planning and publication is drift the refresh did
+    /// not account for, so it aborts rather than stamp it as materialized.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_refresh_aborts_rather_than_certify_view_drift() {
+        let (conn, source) = db_with_source(vec![1, 2, 3]).await;
+        let view = conn
+            .create_materialized_view("drifting_view", "src")
+            .select([("x", "x"), ("twice", "x * 2")])
+            .execute()
+            .await
+            .unwrap();
+        view.refresh().execute().await.unwrap();
+        let certified = source_version_of(view.table()).await;
+
+        // The source loses a row, so the next refresh plans an eviction.
+        source.delete("x = 2").await.unwrap();
+
+        let uri = view
+            .table()
+            .as_native()
+            .unwrap()
+            .dataset
+            .get()
+            .await
+            .unwrap()
+            .uri()
+            .to_string();
+        *DRIFT_TARGET.lock().unwrap() = Some(uri);
+        let refreshing = tokio::spawn(async move { view.refresh().execute().await });
+
+        // Move the view once the refresh has planned against it.
+        tokio::time::timeout(std::time::Duration::from_secs(30), DRIFT_PLANNED.notified())
+            .await
+            .expect("the refresh never reached the eviction boundary");
+        let drifted = conn.open_table("drifting_view").execute().await.unwrap();
+        drifted.delete("twice = 6").await.unwrap();
+        DRIFT_RELEASED.notify_one();
+
+        let err = refreshing.await.unwrap().unwrap_err();
+        assert!(
+            matches!(&err, Error::Runtime { message } if message.contains("raced this refresh")),
+            "got {err:?}"
+        );
+        // The watermark still names the generation that was actually proven.
+        assert_eq!(source_version_of(&drifted).await, certified);
+    }
+
+    async fn source_version_of(table: &Table) -> Option<String> {
+        table
+            .schema()
+            .await
+            .unwrap()
+            .metadata()
+            .get(SOURCE_VERSION_META_KEY)
+            .cloned()
+    }
+
     async fn compact(source: &Table) {
         source
             .optimize(OptimizeAction::Compact {
@@ -1413,6 +1558,40 @@ mod tests {
         assert_eq!(result.mode, RefreshMode::Rebuild);
         assert_eq!(result.rows_written, 2);
         assert_eq!(read(view.table(), "twice").await, vec![2, 4]);
+    }
+
+    /// New and recomputed rows draw on one budget. Capping each stream on
+    /// its own lets their sum exceed the view's limit, so the span has to
+    /// carry both at once to show it.
+    #[tokio::test]
+    async fn test_limit_holds_across_new_and_recomputed_rows() {
+        let (conn, source) = db_with_source(vec![1, 2]).await;
+        let view = conn
+            .create_materialized_view("capped", "src")
+            .select([("x", "x")])
+            .limit(2)
+            .execute()
+            .await
+            .unwrap();
+        view.refresh().execute().await.unwrap();
+        assert_eq!(read(view.table(), "x").await, vec![1, 2]);
+
+        append(&source, vec![3, 4]).await;
+        source
+            .update()
+            .column("x", "11")
+            .only_if("x = 1")
+            .execute()
+            .await
+            .unwrap();
+        let result = view.refresh().execute().await.unwrap();
+        assert_eq!(result.mode, RefreshMode::Incremental);
+        assert_eq!(
+            read(view.table(), "x").await,
+            vec![2, 11],
+            "the budget covers both streams, and a row the view held outranks a new one"
+        );
+        assert_eq!(result.rows_written, 1);
     }
 
     #[tokio::test]
