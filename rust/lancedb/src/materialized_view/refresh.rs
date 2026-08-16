@@ -36,14 +36,19 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_schema::{Schema as ArrowSchema, SchemaRef};
+use datafusion::common::ScalarValue;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+use datafusion::prelude::{col, lit};
 use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::transaction::{Operation, Transaction};
-use lance::dataset::write::merge_insert::inserted_rows::{KeyExistenceFilterBuilder, KeyValue};
+use lance::dataset::write::delete::DeleteBuilder;
+use lance::dataset::write::merge_insert::inserted_rows::{
+    KeyExistenceFilter, KeyExistenceFilterBuilder, KeyValue,
+};
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteDestination, WriteMode, WriteParams};
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID};
 use lance_table::format::Fragment;
@@ -595,11 +600,11 @@ async fn incremental(
     // per source row, keyed by provenance, so evicting them is exact: no
     // other view row is affected, which is why a delete no longer forces a
     // rebuild.
-    let mut evicted_view: Option<Dataset> = None;
     let mut updated_ids: Vec<u64> = Vec::new();
-    // The view generation this refresh plans from. Every commit it makes must
-    // land on the next one, or something it cannot account for interleaved.
-    let generation = &mut view_ds.version().version;
+    // Provenance ids whose view rows this refresh removes: rows the source
+    // dropped, plus rows it changed, whose current values are recomputed and
+    // added back in the same commit.
+    let mut gone: Vec<u64> = Vec::new();
     if (increment.evict_deleted || increment.replace_updated)
         && let Some(watermark) = watermark
     {
@@ -608,14 +613,10 @@ async fn incremental(
             .with_begin_version(watermark)
             .with_end_version(source_version)
             .build()?;
-        let mut view = view_ds.clone();
-        #[cfg(test)]
-        tests::hold_before_eviction(view.uri()).await;
-        let mut evicted = false;
         if increment.evict_deleted {
             let mut stream = delta.get_deleted_row_ids().await?;
             while let Some(batch) = stream.try_next().await? {
-                evicted |= evict_by_provenance(&mut view, &row_ids_of(&batch)?, generation).await?;
+                gone.extend(row_ids_of(&batch)?);
             }
         }
         if increment.replace_updated {
@@ -623,18 +624,18 @@ async fn incremental(
             while let Some(batch) = stream.try_next().await? {
                 updated_ids.extend(row_ids_of(&batch)?);
             }
-            // Their current values are recomputed below and appended, so the
-            // rows the view holds for them go now.
-            evicted |= evict_by_provenance(&mut view, &updated_ids, generation).await?;
-        }
-        if evicted {
-            view_native.dataset.update(view.clone());
-            evicted_view = Some(view);
+            gone.extend(updated_ids.iter().copied());
         }
     }
-    // The eviction commits, so everything below plans from the view it left
-    // rather than the snapshot this refresh opened with.
-    let view_ds = evicted_view.as_ref().unwrap_or(view_ds);
+
+    // Staged, not committed: the removals ride in the same commit as the rows
+    // that replace them, so a reader never sees the view without either.
+    let eviction = if gone.is_empty() {
+        None
+    } else {
+        Some(stage_eviction(view_ds, &gone).await?)
+    };
+
     // The cap counts rows already materialized, in first-materialized order.
     let remaining = match definition.limit {
         Some(limit) => {
@@ -650,9 +651,17 @@ async fn incremental(
         source_version,
         version: view_ds.version().version,
     };
-    if (new_fragments.is_empty() && updated_ids.is_empty()) || remaining == Some(0) {
+    let nothing_to_add =
+        (new_fragments.is_empty() && updated_ids.is_empty()) || remaining == Some(0);
+    if nothing_to_add && eviction.is_none() {
         result.version =
             stamp_watermark(view_native, view_ds.clone(), source_version, source_ts).await?;
+        return Ok(result);
+    }
+    // Rows left but none arrive: the removals still have to be published.
+    if nothing_to_add {
+        let published = publish(view_ds, eviction, Vec::new(), None).await?;
+        result.version = stamp_watermark(view_native, published, source_version, source_ts).await?;
         return Ok(result);
     }
 
@@ -702,10 +711,14 @@ async fn incremental(
     }
 
     // Nothing survived the filter: the watermark still has to advance or the
-    // same fragments would be rescanned forever.
+    // same fragments would be rescanned forever, but any removals still do.
     let Some(first) = stream.try_next().await? else {
-        result.version =
-            stamp_watermark(view_native, view_ds.clone(), source_version, source_ts).await?;
+        let published = if eviction.is_some() {
+            publish(view_ds, eviction, Vec::new(), None).await?
+        } else {
+            view_ds.clone()
+        };
+        result.version = stamp_watermark(view_native, published, source_version, source_ts).await?;
         return Ok(result);
     };
     let stream: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
@@ -744,35 +757,7 @@ async fn incremental(
             message: "the provenance key filter was poisoned mid-refresh".into(),
         })?
         .build();
-    let appended = CommitBuilder::new(WriteDestination::Dataset(ds))
-        .execute(Transaction::new(
-            *generation,
-            Operation::Update {
-                removed_fragment_ids: Vec::new(),
-                updated_fragments: Vec::new(),
-                new_fragments,
-                fields_modified: Vec::new(),
-                compacted_sstables: Vec::new(),
-                fields_for_preserving_frag_bitmap: Vec::new(),
-                update_mode: None,
-                inserted_rows_filter: Some(filter),
-                updated_fragment_offsets: None,
-            },
-            None,
-        ))
-        .await?;
-    // Lance rejects an append whose provenance keys overlap a concurrent one,
-    // but an unrelated write to the view is not a key conflict, so the
-    // generation is checked here as well as at eviction.
-    if appended.version().version != *generation + 1 {
-        return Err(Error::Runtime {
-            message: format!(
-                "a concurrent commit raced this refresh (view version {}); \
-                 the refresh is unrecorded and the next one will rebuild",
-                appended.version().version
-            ),
-        });
-    }
+    let appended = publish(view_ds, eviction, new_fragments, Some(filter)).await?;
     result.rows_written = rows_written.load(Ordering::Relaxed);
     result.version = stamp_watermark(view_native, appended, source_version, source_ts).await?;
     Ok(result)
@@ -1026,10 +1011,48 @@ async fn compute_stream(
     Ok(Box::pin(RecordBatchStreamAdapter::new(schema, mapped)))
 }
 
-/// Ids per eviction predicate. A delete names the rows it removes inline, so
-/// the batch size is what keeps the SQL bounded when a source drops far more
-/// rows than one statement should carry.
-const EVICTION_CHUNK: usize = 4096;
+/// Commit the view's removals and additions as one change, on the exact
+/// generation the refresh planned from. Lance rejects an overlapping
+/// provenance key, but an unrelated write to the view is not a key conflict,
+/// so the generation is checked here too.
+async fn publish(
+    view_ds: &Dataset,
+    eviction: Option<(Vec<Fragment>, Vec<u64>)>,
+    new_fragments: Vec<Fragment>,
+    keys: Option<KeyExistenceFilter>,
+) -> Result<Dataset> {
+    let planned = view_ds.version().version;
+    #[cfg(test)]
+    tests::hold_before_publish(view_ds.uri()).await;
+    let (updated_fragments, removed_fragment_ids) = eviction.unwrap_or_default();
+    let committed = CommitBuilder::new(WriteDestination::Dataset(Arc::new(view_ds.clone())))
+        .execute(Transaction::new(
+            planned,
+            Operation::Update {
+                removed_fragment_ids,
+                updated_fragments,
+                new_fragments,
+                fields_modified: Vec::new(),
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: Vec::new(),
+                update_mode: None,
+                inserted_rows_filter: keys,
+                updated_fragment_offsets: None,
+            },
+            None,
+        ))
+        .await?;
+    if committed.version().version != planned + 1 {
+        return Err(Error::Runtime {
+            message: format!(
+                "a concurrent commit raced this refresh (view version {}); \
+                 the refresh is unrecorded and the next one will rebuild",
+                committed.version().version
+            ),
+        });
+    }
+    Ok(committed)
+}
 
 fn row_ids_of(batch: &RecordBatch) -> Result<Vec<u64>> {
     let column = batch.column_by_name(ROW_ID).ok_or_else(|| Error::Runtime {
@@ -1043,39 +1066,31 @@ fn row_ids_of(batch: &RecordBatch) -> Result<Vec<u64>> {
     Ok(ids.values().to_vec())
 }
 
-/// Drop the view rows carrying `ids`, one bounded statement at a time.
-/// Repeating a chunk is harmless, so a refresh that fails partway leaves the
-/// next one the same work.
-async fn evict_by_provenance(
-    view: &mut Dataset,
-    ids: &[u64],
-    generation: &mut u64,
-) -> Result<bool> {
-    for chunk in ids.chunks(EVICTION_CHUNK) {
-        let predicate = format!(
-            "{SOURCE_ROW_ID_COLUMN} IN ({})",
-            chunk
-                .iter()
-                .map(u64::to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        view.delete(&predicate).await?;
-        *generation += 1;
-        // An eviction that did not land on the generation it planned from has
-        // been interleaved with a write this refresh cannot account for, and
-        // certifying it would stamp that drift as materialized.
-        if view.version().version != *generation {
-            return Err(Error::Runtime {
-                message: format!(
-                    "a concurrent commit raced this refresh (view version {}); \
-                     the refresh is unrecorded and the next one will rebuild",
-                    view.version().version
-                ),
-            });
-        }
-    }
-    Ok(!ids.is_empty())
+/// The fragment changes that remove the view's rows for `ids`, staged rather
+/// than committed so they can ride in the refresh's single data commit.
+async fn stage_eviction(view_ds: &Dataset, ids: &[u64]) -> Result<(Vec<Fragment>, Vec<u64>)> {
+    // An expression rather than SQL text: the id list is a value here, not a
+    // predicate string that grows with the delta and has to be parsed.
+    let predicate = col(SOURCE_ROW_ID_COLUMN).in_list(
+        ids.iter()
+            .map(|id| lit(ScalarValue::UInt64(Some(*id))))
+            .collect(),
+        false,
+    );
+    let staged = DeleteBuilder::from_expr(Arc::new(view_ds.clone()), predicate)
+        .execute_uncommitted()
+        .await?;
+    let Operation::Delete {
+        updated_fragments,
+        deleted_fragment_ids,
+        ..
+    } = staged.transaction.operation
+    else {
+        return Err(Error::Runtime {
+            message: "expected a delete when staging the view's evictions".into(),
+        });
+    };
+    Ok((updated_fragments, deleted_fragment_ids))
 }
 
 fn source_row_id_field_id(view_ds: &Dataset) -> Result<i32> {
@@ -1124,9 +1139,9 @@ fn collect_source_row_ids(
 #[cfg(test)]
 mod tests {
 
-    /// Park a refresh between planning and eviction so a test can move the
-    /// view underneath it. Inert unless [`DRIFT_TARGET`] names this view.
-    pub(super) async fn hold_before_eviction(uri: &str) {
+    /// Park a refresh between planning and publication so a test can move
+    /// the view underneath it. Inert unless [`DRIFT_TARGET`] names this view.
+    pub(super) async fn hold_before_publish(uri: &str) {
         {
             let mut target = DRIFT_TARGET.lock().unwrap();
             if target.as_deref() != Some(uri) {
@@ -1140,6 +1155,9 @@ mod tests {
         DRIFT_RELEASED.notified().await;
     }
 
+    /// The rendezvous below is one global pair, so the cases that use it run
+    /// one at a time rather than trading each other's signals.
+    pub(super) static DRIFT_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
     pub(super) static DRIFT_TARGET: StdMutex<Option<String>> = StdMutex::new(None);
     pub(super) static DRIFT_PLANNED: tokio::sync::Notify = tokio::sync::Notify::const_new();
     pub(super) static DRIFT_RELEASED: tokio::sync::Notify = tokio::sync::Notify::const_new();
@@ -1369,6 +1387,7 @@ mod tests {
     /// not account for, so it aborts rather than stamp it as materialized.
     #[tokio::test(flavor = "multi_thread")]
     async fn test_refresh_aborts_rather_than_certify_view_drift() {
+        let _serial = DRIFT_LOCK.lock().await;
         let (conn, source) = db_with_source(vec![1, 2, 3]).await;
         let view = conn
             .create_materialized_view("drifting_view", "src")
@@ -1398,14 +1417,18 @@ mod tests {
         // Move the view once the refresh has planned against it.
         tokio::time::timeout(std::time::Duration::from_secs(30), DRIFT_PLANNED.notified())
             .await
-            .expect("the refresh never reached the eviction boundary");
+            .expect("the refresh never reached the publication boundary");
         let drifted = conn.open_table("drifting_view").execute().await.unwrap();
         drifted.delete("twice = 6").await.unwrap();
         DRIFT_RELEASED.notify_one();
 
+        // Publishing removals and additions as one change makes the drift a
+        // conflict lance itself rejects; a pure append, which touches no
+        // existing fragment, still relies on the generation check.
         let err = refreshing.await.unwrap().unwrap_err();
+        let message = err.to_string();
         assert!(
-            matches!(&err, Error::Runtime { message } if message.contains("raced this refresh")),
+            message.contains("raced this refresh") || message.contains("preempted by concurrent"),
             "got {err:?}"
         );
         // The watermark still names the generation that was actually proven.
@@ -1446,6 +1469,57 @@ mod tests {
         // A second refresh must not double them either.
         view.refresh().execute().await.unwrap();
         assert_eq!(read(view.table(), "twice").await, vec![2, 4]);
+    }
+
+    /// A refresh publishes what it removes and what it adds as one change,
+    /// so an update never exposes the view without the rows it is replacing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_an_update_is_never_visible_as_a_gap() {
+        let _serial = DRIFT_LOCK.lock().await;
+        let (conn, source) = db_with_source(vec![1, 2, 3]).await;
+        let view = conn
+            .create_materialized_view("atomic_view", "src")
+            .select([("x", "x"), ("twice", "x * 2")])
+            .execute()
+            .await
+            .unwrap();
+        view.refresh().execute().await.unwrap();
+
+        source
+            .update()
+            .column("x", "x + 10")
+            .execute()
+            .await
+            .unwrap();
+
+        let uri = view
+            .table()
+            .as_native()
+            .unwrap()
+            .dataset
+            .get()
+            .await
+            .unwrap()
+            .uri()
+            .to_string();
+        *DRIFT_TARGET.lock().unwrap() = Some(uri);
+        let refreshing = tokio::spawn(async move { view.refresh().execute().await });
+
+        // Read the view while the refresh is staged but not yet published.
+        tokio::time::timeout(std::time::Duration::from_secs(30), DRIFT_PLANNED.notified())
+            .await
+            .expect("the refresh never reached the publication boundary");
+        let midway = conn.open_table("atomic_view").execute().await.unwrap();
+        assert_eq!(
+            read(&midway, "twice").await,
+            vec![2, 4, 6],
+            "the pre-refresh rows must still be there in full"
+        );
+        DRIFT_RELEASED.notify_one();
+
+        refreshing.await.unwrap().unwrap();
+        let after = conn.open_table("atomic_view").execute().await.unwrap();
+        assert_eq!(read(&after, "twice").await, vec![22, 24, 26]);
     }
 
     async fn compact(source: &Table) {
