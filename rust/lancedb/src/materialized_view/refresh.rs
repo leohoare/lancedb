@@ -4,17 +4,17 @@
 //! Refreshing materialized views.
 //!
 //! A refresh pins one source version and brings the view to exactly the
-//! definition's result at that version. It is incremental -- computing only
-//! the source fragments that carry new rows, and appending -- when the source
-//! changed by nothing but appends and compactions since the last refresh: a
-//! compaction rearranges rows without changing them, so its outputs need no
-//! recompute (this is why a source must keep stable row ids -- skipping the
-//! recompute is only sound while [`SOURCE_ROW_ID_COLUMN`] stays valid across
-//! the rewrite). A delete, an update, a vacuumed watermark version, or an
-//! append the classifier cannot separate from a compaction that swallowed it
-//! rebuilds the view from scratch. Rebuilding an indexed view swaps all
-//! fragments in one commit that retains index definitions, so readers never
-//! see the view unindexed or empty.
+//! definition's result at that version. It is incremental when it can
+//! reconcile what changed: rows the source added are computed and appended,
+//! and rows it removed or changed are evicted by provenance id, the changed
+//! ones recomputed into the same pass. A compaction rearranges rows without
+//! changing them, so its outputs need no recompute -- this is why a source
+//! must keep stable row ids, since skipping that recompute is only sound
+//! while [`SOURCE_ROW_ID_COLUMN`] stays valid across the rewrite. A vacuumed
+//! watermark version, or an append the classifier cannot separate from a
+//! compaction that swallowed it, rebuilds from scratch. Rebuilding an
+//! indexed view swaps all fragments in one commit that retains index
+//! definitions, so readers never see the view unindexed or empty.
 //!
 //! The watermark ([`SOURCE_VERSION_META_KEY`]) is stamped in a follow-up
 //! commit after the data lands. A crash or race between the two leaves the
@@ -22,22 +22,10 @@
 //! and the next refresh rebuilds rather than trusting any of it.
 //!
 //! Refreshes of one view are serialized within a process by a per-view lock.
-//! Across processes nothing serializes them: two incremental refreshes
-//! planned at the same watermark each append the same rows, and both
-//! appends become durable. The version check that follows a write cannot
-//! prevent this -- lance rebases a conflicting append rather than rejecting
-//! it, so the loser's rows land and only then does it report an abort. Its
-//! error says the refresh is "unrecorded", which is true of the watermark
-//! and false of the rows: the view serves duplicates until something
-//! rebuilds it.
-//!
-//! Closing this needs the data and the watermark to commit as one
-//! transaction, which no current lance operation expresses (`Append` and
-//! `Update` carry fragments, `UpdateConfig` carries schema metadata, and
-//! `Overwrite` -- which carries config -- rebases over concurrent metadata
-//! commits). Until then, run one process's refreshes against a view at a
-//! time. `differential::concurrent_refreshes_hold_each_row_once` is the
-//! reproducer.
+//! Across processes the commit serializes them: an incremental refresh
+//! carries the provenance ids it materialized as an inserted-rows filter, so
+//! two that planned the same rows conflict and only one lands. The loser
+//! reports a retryable conflict and replans against the generation that won.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};

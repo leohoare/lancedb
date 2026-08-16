@@ -979,8 +979,8 @@ impl MaterializedView {
 
     /// Recompute the view from its source.
     ///
-    /// By default the refresh is incremental when the source only gained rows
-    /// since the last one, and otherwise rebuilds; see
+    /// By default the refresh is incremental when the source's changes can be
+    /// reconciled into the view, and otherwise rebuilds; see
     /// [`RefreshMaterializedViewBuilder`].
     ///
     /// ```no_run
