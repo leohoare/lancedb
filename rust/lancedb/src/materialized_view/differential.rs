@@ -43,14 +43,22 @@ enum SrcOp {
     Compact,
     /// A column the view does not read must NOT force a rebuild.
     AddColumn,
+    /// merge_insert commits an Update whose by-source arm deletes rows, so a
+    /// classifier that reads Update as "changed only" loses those deletions.
+    MergeDropLargest,
+    /// merge_insert that both changes existing rows and inserts new ones in
+    /// one transaction.
+    MergeUpsert,
 }
 
-const ALL_OPS: [SrcOp; 5] = [
+const ALL_OPS: [SrcOp; 7] = [
     SrcOp::AppendNew,
     SrcOp::DeleteEven,
     SrcOp::UpdateOddScore,
     SrcOp::Compact,
     SrcOp::AddColumn,
+    SrcOp::MergeDropLargest,
+    SrcOp::MergeUpsert,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,20 +68,31 @@ enum Shape {
     /// SELECT id, score WHERE score > 50: additionally sensitive to rows
     /// crossing the predicate.
     Filtered,
+    /// SELECT id, score LIMIT 4. Which rows are held depends on the order
+    /// they were first materialized, so the oracle checks containment and
+    /// the cap rather than equality.
+    Limited,
 }
 
 impl Shape {
     fn filter(&self) -> Option<&'static str> {
         match self {
-            Self::Identity => None,
+            Self::Identity | Self::Limited => None,
             Self::Filtered => Some("score > 50"),
         }
     }
 
     fn matches(&self, score: f32) -> bool {
         match self {
-            Self::Identity => true,
+            Self::Identity | Self::Limited => true,
             Self::Filtered => score > 50.0,
+        }
+    }
+
+    fn limit(&self) -> Option<usize> {
+        match self {
+            Self::Limited => Some(4),
+            _ => None,
         }
     }
 }
@@ -102,6 +121,21 @@ fn rows_batch(ids: &[i32]) -> RecordBatch {
     .unwrap()
 }
 
+fn merge_batch(ids: &[i32]) -> RecordBatch {
+    let scores: Vec<f32> = ids.iter().map(|id| (*id * 10 + 5) as f32).collect();
+    RecordBatch::try_new(
+        Arc::new(ArrowSchema::new(vec![
+            ArrowField::new("id", DataType::Int32, true),
+            ArrowField::new("score", DataType::Float32, true),
+        ])),
+        vec![
+            Arc::new(Int32Array::from(ids.to_vec())),
+            Arc::new(Float32Array::from(scores)),
+        ],
+    )
+    .unwrap()
+}
+
 impl Case {
     async fn new(shape: Shape) -> Self {
         let conn = connect("memory://").execute().await.unwrap();
@@ -116,6 +150,9 @@ impl Case {
             .select([("id", "id"), ("score", "score")]);
         if let Some(filter) = shape.filter() {
             builder = builder.only_if(filter);
+        }
+        if let Some(limit) = shape.limit() {
+            builder = builder.limit(limit as u64);
         }
         let view = builder.execute().await.unwrap();
         Self {
@@ -158,6 +195,36 @@ impl Case {
                     .await
                     .unwrap();
             }
+            SrcOp::MergeDropLargest => {
+                let mut ids = self.source_ids().await;
+                ids.sort_unstable();
+                ids.pop();
+                if ids.is_empty() {
+                    return;
+                }
+                let batch = rows_batch(&ids);
+                let reader =
+                    arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+                let mut merge = self.source.merge_insert(&["id"]);
+                merge.when_not_matched_by_source_delete(None);
+                merge.execute(Box::new(reader)).await.unwrap();
+            }
+            SrcOp::MergeUpsert => {
+                let mut ids = self.source_ids().await;
+                ids.sort_unstable();
+                // One row that exists (updated in place) and one that does not.
+                let existing = ids.first().copied().unwrap_or(self.next_id);
+                let fresh = self.next_id;
+                self.next_id += 1;
+                let batch = merge_batch(&[existing, fresh]);
+                let reader =
+                    arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+                let mut merge = self.source.merge_insert(&["id"]);
+                merge
+                    .when_matched_update_all(None)
+                    .when_not_matched_insert_all();
+                merge.execute(Box::new(reader)).await.unwrap();
+            }
             SrcOp::AddColumn => {
                 self.added_columns += 1;
                 let field = ArrowField::new(
@@ -175,6 +242,18 @@ impl Case {
                     .unwrap();
             }
         }
+    }
+
+    async fn source_ids(&self) -> Vec<i32> {
+        read_rows(
+            self.source
+                .query()
+                .select(Select::columns(&["id", "score"])),
+        )
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
     }
 
     /// The definition's result, read independently of the refresh path:
@@ -208,9 +287,38 @@ impl Case {
     async fn check(&self, label: &str) -> Result<(), String> {
         let expected = self.oracle().await;
         let actual = self.view_rows().await;
-        if expected != actual {
+        let Some(cap) = self.shape.limit() else {
+            if expected != actual {
+                return Err(format!(
+                    "{label}: view diverged from oracle\n  expected: {expected:?}\n  actual:   {actual:?}"
+                ));
+            }
+            return Ok(());
+        };
+        // A capped view holds some subset of the definition's result, never
+        // more than the cap, and never the same row twice.
+        if actual.len() > cap {
             return Err(format!(
-                "{label}: view diverged from oracle\n  expected: {expected:?}\n  actual:   {actual:?}"
+                "{label}: view holds {} rows, over its cap of {cap}: {actual:?}",
+                actual.len()
+            ));
+        }
+        let mut unique = actual.clone();
+        unique.dedup();
+        if unique.len() != actual.len() {
+            return Err(format!("{label}: view holds a row twice: {actual:?}"));
+        }
+        if let Some(stray) = actual.iter().find(|row| !expected.contains(row)) {
+            return Err(format!(
+                "{label}: view holds {stray:?}, which the definition does not select: {expected:?}"
+            ));
+        }
+        // Below the cap the view must be complete, or a row was lost.
+        if actual.len() < cap.min(expected.len()) {
+            return Err(format!(
+                "{label}: view holds {} of {} selectable rows under a cap of {cap}: {actual:?}",
+                actual.len(),
+                expected.len()
             ));
         }
         Ok(())
@@ -276,15 +384,15 @@ async fn run_sequence(ops: &[SrcOp], shape: Shape) -> Result<(), String> {
     Ok(())
 }
 
-/// Every op sequence up to `max_len`, base-5 enumerated.
+/// Every op sequence up to `max_len`.
 fn all_sequences(max_len: u32) -> Vec<Vec<SrcOp>> {
     let mut sequences = Vec::new();
     for len in 1..=max_len {
-        for mut index in 0..5usize.pow(len) {
+        for mut index in 0..ALL_OPS.len().pow(len) {
             let mut ops = Vec::with_capacity(len as usize);
             for _ in 0..len {
-                ops.push(ALL_OPS[index % 5]);
-                index /= 5;
+                ops.push(ALL_OPS[index % ALL_OPS.len()]);
+                index /= ALL_OPS.len();
             }
             sequences.push(ops);
         }
@@ -294,7 +402,7 @@ fn all_sequences(max_len: u32) -> Vec<Vec<SrcOp>> {
 
 async fn run_exhaustive(max_len: u32) {
     let mut cases = Vec::new();
-    for shape in [Shape::Identity, Shape::Filtered] {
+    for shape in [Shape::Identity, Shape::Filtered, Shape::Limited] {
         for ops in all_sequences(max_len) {
             cases.push((ops, shape));
         }
