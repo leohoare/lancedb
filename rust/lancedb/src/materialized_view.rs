@@ -656,6 +656,13 @@ impl MaterializedView {
     /// [`Error::NotSupported`] for a view whose kind this version cannot
     /// refresh.
     pub async fn from_table(table: Table) -> Result<Self> {
+        // Same local-only boundary the connection-level entry points hold,
+        // applied before the schema read so a remote table costs no request.
+        if table.as_native().is_none() {
+            return Err(Error::NotSupported {
+                message: "materialized views are supported only on local databases".into(),
+            });
+        }
         let schema = table.schema().await?;
         match materialized_view_kind(schema.metadata())? {
             Some(MaterializedViewKind::Select(definition)) => Ok(Self { table, definition }),
