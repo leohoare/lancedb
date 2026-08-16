@@ -459,11 +459,10 @@ async fn concurrency_view_ids(conn: &Connection) -> Vec<i32> {
 
 /// One refresh of the view at `MV_RACE_DIR`, in its own process.
 ///
-/// Every expensive step -- connecting, opening the view, reading its
-/// definition -- happens BEFORE the barrier, so both processes enter
-/// `refresh()` together. With that setup inside the barrier instead,
-/// uneven warm-up lets one process finish before the other starts
-/// planning and the race silently fails to occur.
+/// Setup happens before the start barrier so warm-up does not stagger the
+/// two processes. What makes the race certain rather than likely is the
+/// second barrier inside `refresh()` itself, which holds every participant
+/// between staging and commit.
 #[tokio::test]
 #[ignore = "spawned as a child process by the concurrency cases"]
 async fn cross_process_refresh_child() {
