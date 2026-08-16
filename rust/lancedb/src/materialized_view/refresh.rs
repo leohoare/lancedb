@@ -55,6 +55,7 @@ use futures::{StreamExt, TryStreamExt};
 use lance::Dataset;
 use lance::dataset::mem_wal::DatasetMemWalExt;
 use lance::dataset::transaction::{Operation, Transaction};
+use lance::dataset::write::merge_insert::inserted_rows::{KeyExistenceFilterBuilder, KeyValue};
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteDestination, WriteMode, WriteParams};
 use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID};
 use lance_table::format::Fragment;
@@ -700,25 +701,54 @@ async fn incremental(
         futures::stream::iter([Ok(first)]).chain(stream),
     ));
 
-    let appended = InsertBuilder::new(WriteDestination::Dataset(Arc::new(view_ds.clone())))
+    // Two refreshes that materialize the same source row must not both
+    // commit. Carrying the provenance ids as an inserted-rows filter makes
+    // lance reject the second on key overlap, while leaving refreshes over
+    // disjoint source rows free to proceed.
+    let keys = Arc::new(StdMutex::new(KeyExistenceFilterBuilder::new(vec![
+        source_row_id_field_id(view_ds)?,
+    ])));
+    let stream = collect_source_row_ids(stream, keys.clone());
+
+    let ds = Arc::new(view_ds.clone());
+    let write_txn = InsertBuilder::new(WriteDestination::Dataset(ds.clone()))
         .with_params(&WriteParams {
             mode: WriteMode::Append,
             ..Default::default()
         })
-        .execute_stream(stream)
+        .execute_uncommitted_stream(stream)
         .await?;
-    // Lance rebases an append over an intervening delete or update; a data
-    // commit that did not land directly on the planned generation may have
-    // absorbed one and must not be certified.
-    if appended.version().version != view_ds.version().version + 1 {
+    let Operation::Append {
+        fragments: new_fragments,
+    } = write_txn.operation
+    else {
         return Err(Error::Runtime {
-            message: format!(
-                "a concurrent commit raced this refresh (view version {}); the \
-                 refresh is unrecorded and the next one will rebuild",
-                appended.version().version
-            ),
+            message: "expected an append when staging the view's new rows".into(),
         });
-    }
+    };
+    let filter = keys
+        .lock()
+        .map_err(|_| Error::Runtime {
+            message: "the provenance key filter was poisoned mid-refresh".into(),
+        })?
+        .build();
+    let appended = CommitBuilder::new(WriteDestination::Dataset(ds))
+        .execute(Transaction::new(
+            view_ds.version().version,
+            Operation::Update {
+                removed_fragment_ids: Vec::new(),
+                updated_fragments: Vec::new(),
+                new_fragments,
+                fields_modified: Vec::new(),
+                compacted_sstables: Vec::new(),
+                fields_for_preserving_frag_bitmap: Vec::new(),
+                update_mode: None,
+                inserted_rows_filter: Some(filter),
+                updated_fragment_offsets: None,
+            },
+            None,
+        ))
+        .await?;
     result.rows_written = rows_written.load(Ordering::Relaxed);
     result.version = stamp_watermark(view_native, appended, source_version, source_ts).await?;
     Ok(result)
@@ -1005,6 +1035,47 @@ async fn evict_by_provenance(view: &mut Dataset, ids: &[u64]) -> Result<bool> {
         view.delete(&predicate).await?;
     }
     Ok(!ids.is_empty())
+}
+
+fn source_row_id_field_id(view_ds: &Dataset) -> Result<i32> {
+    view_ds
+        .schema()
+        .field(SOURCE_ROW_ID_COLUMN)
+        .map(|f| f.id)
+        .ok_or_else(|| Error::Runtime {
+            message: format!("the view has no '{SOURCE_ROW_ID_COLUMN}' column"),
+        })
+}
+
+/// Tee the provenance ids of everything written into `keys`.
+fn collect_source_row_ids(
+    stream: SendableRecordBatchStream,
+    keys: Arc<StdMutex<KeyExistenceFilterBuilder>>,
+) -> SendableRecordBatchStream {
+    let schema = stream.schema();
+    let mapped = stream.map(move |batch| {
+        let batch = batch?;
+        let column = batch
+            .column_by_name(SOURCE_ROW_ID_COLUMN)
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!(
+                    "'{SOURCE_ROW_ID_COLUMN}' is missing from the rows being written"
+                ))
+            })?
+            .as_primitive_opt::<UInt64Type>()
+            .ok_or_else(|| {
+                DataFusionError::Internal(format!("'{SOURCE_ROW_ID_COLUMN}' is not a uint64"))
+            })?;
+        let mut keys = keys
+            .lock()
+            .map_err(|_| DataFusionError::Internal("provenance key filter poisoned".into()))?;
+        for id in column.values() {
+            keys.insert(KeyValue::UInt64(*id))
+                .map_err(|e| DataFusionError::Internal(e.to_string()))?;
+        }
+        Ok(batch)
+    });
+    Box::pin(RecordBatchStreamAdapter::new(schema, mapped))
 }
 
 #[cfg(test)]
