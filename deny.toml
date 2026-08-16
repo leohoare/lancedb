@@ -196,4 +196,7 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 # releases are cut to crates.io. Allow that specific host.
 allow-git = [
     "https://github.com/lance-format/lance",
+    # Scaffolding, paired with the [patch] section in Cargo.toml. Remove both
+    # once deleted-row-id reporting is released from lance-format/lance.
+    "https://github.com/wkalt/lance",
 ]

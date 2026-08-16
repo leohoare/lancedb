@@ -80,3 +80,19 @@ debug = false
 debug-assertions = false
 strip = "debuginfo"
 incremental = false
+
+[patch."https://github.com/lance-format/lance.git"]
+lance = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-arrow = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-core = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-datafusion = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-datagen = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-encoding = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-file = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-index = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-io = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-linalg = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-namespace = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-namespace-impls = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-table = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
+lance-testing = { git = "https://github.com/wkalt/lance.git", branch = "ticket/ent-1961/delta-deleted-row-ids" }
