@@ -593,9 +593,8 @@ export class LocalConnection extends Connection {
   }
 
   async openMaterializedView(name: string): Promise<MaterializedView> {
-    const view = new MaterializedView(await this.openTable(name));
-    await view.definition();
-    return view;
+    const innerTable = await this.inner.openMaterializedView(name);
+    return new MaterializedView(new LocalTable(innerTable));
   }
 
   async listMaterializedViews(): Promise<string[]> {

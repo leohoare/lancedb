@@ -299,6 +299,16 @@ impl Connection {
     }
 
     #[napi(catch_unwind)]
+    pub async fn open_materialized_view(&self, name: String) -> napi::Result<Table> {
+        let view = self
+            .get_inner()?
+            .open_materialized_view(&name)
+            .await
+            .default_error()?;
+        Ok(Table::new(view.table().clone()))
+    }
+
+    #[napi(catch_unwind)]
     pub async fn list_materialized_views(&self) -> napi::Result<Vec<String>> {
         let views = self
             .get_inner()?
