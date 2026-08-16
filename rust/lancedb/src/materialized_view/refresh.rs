@@ -311,6 +311,14 @@ async fn plan_increment(
         if folded {
             return None;
         }
+        // A cap stops rows being materialized once the view is full, and the
+        // watermark then advances past them. Eviction can free room those
+        // rows should fill, but they are no longer in any delta, so a capped
+        // view cannot reconcile a removal incrementally. Rebuilding it is
+        // cheap for the same reason it is capped: the scan stops at the cap.
+        if definition.limit.is_some() && (delta.deleted_rows || delta.updated_rows) {
+            return None;
+        }
         // Every other fragment new at head is an append: appends and rewrites
         // are the only operations in the delta that add fragments, and the
         // rewrite outputs are already-materialized rows rearranged.
@@ -409,10 +417,15 @@ async fn appends_and_rewrites(cur: &Dataset, from: u64, to: u64) -> Option<TxnDe
                 // rows rather than changing them.
                 delta.deleted_rows = true;
                 delta.rewritten.extend(removed_fragment_ids.iter().copied());
-                delta.produced.extend(new_fragments.iter().map(|f| f.id));
+                // Only ids of fragments that already existed are real here: a
+                // transaction file carries placeholder ids for the fragments
+                // it creates, and into an empty source those collide with the
+                // ids the commit then assigns. Rewritten rows are excluded by
+                // creation version below, not by fragment identity.
                 delta
                     .produced
                     .extend(updated_fragments.iter().map(|f| f.id));
+                let _ = new_fragments;
             }
             Operation::Rewrite { groups, .. } => {
                 for group in groups {
@@ -676,7 +689,6 @@ async fn incremental(
             definition,
             RowScope {
                 row_ids: Some(&updated_ids),
-                limit: remaining,
                 ..Default::default()
             },
             schema.clone(),
@@ -687,11 +699,6 @@ async fn incremental(
             schema.clone(),
             recomputed.chain(stream),
         ));
-    }
-    // New and recomputed rows compete for one budget: capping each stream
-    // separately lets their sum exceed the view's cap.
-    if let Some(remaining) = remaining {
-        stream = take_rows(stream, remaining);
     }
 
     // Nothing survived the filter: the watermark still has to advance or the
@@ -1071,28 +1078,6 @@ async fn evict_by_provenance(
     Ok(!ids.is_empty())
 }
 
-/// Cap a stream at `limit` rows, slicing the batch that crosses the boundary.
-fn take_rows(stream: SendableRecordBatchStream, limit: u64) -> SendableRecordBatchStream {
-    let schema = stream.schema();
-    let capped = stream.scan(0u64, move |taken, batch| {
-        let out = batch.map(|batch| {
-            let room = limit.saturating_sub(*taken) as usize;
-            let batch = if batch.num_rows() > room {
-                batch.slice(0, room)
-            } else {
-                batch
-            };
-            *taken += batch.num_rows() as u64;
-            batch
-        });
-        std::future::ready(match &out {
-            Ok(batch) if batch.num_rows() == 0 => None,
-            _ => Some(out),
-        })
-    });
-    Box::pin(RecordBatchStreamAdapter::new(schema, capped))
-}
-
 fn source_row_id_field_id(view_ds: &Dataset) -> Result<i32> {
     view_ds
         .schema()
@@ -1437,6 +1422,32 @@ mod tests {
             .cloned()
     }
 
+    /// A transaction file carries placeholder ids for the fragments it
+    /// creates. Into an empty source those collide with the ids the commit
+    /// assigns, so treating them as already-materialized drops the very
+    /// first rows while the watermark still advances past them.
+    #[tokio::test]
+    async fn test_merge_into_an_empty_source_is_materialized() {
+        let (conn, source) = db_with_source(vec![]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+        assert_eq!(read(view.table(), "twice").await, Vec::<i32>::new());
+
+        let batch = record_batch!(("x", Int32, vec![1, 2])).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut merge = source.merge_insert(&["x"]);
+        merge
+            .when_matched_update_all(None)
+            .when_not_matched_insert_all();
+        merge.execute(Box::new(reader)).await.unwrap();
+
+        view.refresh().execute().await.unwrap();
+        assert_eq!(read(view.table(), "twice").await, vec![2, 4]);
+        // A second refresh must not double them either.
+        view.refresh().execute().await.unwrap();
+        assert_eq!(read(view.table(), "twice").await, vec![2, 4]);
+    }
+
     async fn compact(source: &Table) {
         source
             .optimize(OptimizeAction::Compact {
@@ -1560,11 +1571,12 @@ mod tests {
         assert_eq!(read(view.table(), "twice").await, vec![2, 4]);
     }
 
-    /// New and recomputed rows draw on one budget. Capping each stream on
-    /// its own lets their sum exceed the view's limit, so the span has to
-    /// carry both at once to show it.
+    /// A cap and incremental reconciliation do not compose: rows skipped at
+    /// the cap fall behind the watermark, so room freed later cannot be
+    /// refilled from any delta. A capped view rebuilds instead, which its
+    /// own cap keeps cheap.
     #[tokio::test]
-    async fn test_limit_holds_across_new_and_recomputed_rows() {
+    async fn test_limited_view_rebuilds_rather_than_reconcile() {
         let (conn, source) = db_with_source(vec![1, 2]).await;
         let view = conn
             .create_materialized_view("capped", "src")
@@ -1585,13 +1597,14 @@ mod tests {
             .await
             .unwrap();
         let result = view.refresh().execute().await.unwrap();
-        assert_eq!(result.mode, RefreshMode::Incremental);
-        assert_eq!(
-            read(view.table(), "x").await,
-            vec![2, 11],
-            "the budget covers both streams, and a row the view held outranks a new one"
+        assert_eq!(result.mode, RefreshMode::Rebuild);
+        let held = read(view.table(), "x").await;
+        assert_eq!(held.len(), 2, "the cap holds: {held:?}");
+        let selectable = read(&source, "x").await;
+        assert!(
+            held.iter().all(|x| selectable.contains(x)),
+            "{held:?} is not a subset of {selectable:?}"
         );
-        assert_eq!(result.rows_written, 1);
     }
 
     #[tokio::test]
