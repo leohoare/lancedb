@@ -125,15 +125,15 @@ class AsyncMaterializedView:
     ) -> "RefreshMaterializedViewResult":
         """Recompute the view from its source.
 
-        The refresh is incremental when the source only gained rows since the
-        last one, and otherwise rebuilds. ``full=True`` forces a rebuild;
+        The refresh is incremental when the source's changes can be
+        reconciled into the view -- rows added, changed or removed since the
+        last one -- and otherwise rebuilds. ``full=True`` forces a rebuild;
         ``source_version`` refreshes to that source version instead of the
         latest.
 
-        Refreshes of one view are serialized within a process. Nothing
-        serializes them across processes: two concurrent refreshes of the
-        same view from different processes can append duplicate rows. Run
-        one process's refreshes against a view at a time.
+        Concurrent refreshes of one view do not duplicate its rows. Two that
+        plan the same source rows conflict on commit, and the loser raises
+        rather than writing them a second time.
         """
         return await self._table._inner.refresh_materialized_view(
             full=full, source_version=source_version
