@@ -487,10 +487,18 @@ async fn cross_process_refresh_child() {
     }
 
     let outcome = match view.refresh().execute().await {
-        Ok(result) => format!("ok mode={:?} rows={}", result.mode, result.rows_written),
-        Err(err) => format!("err {err}"),
+        Ok(result) => format!("committed rows={}", result.rows_written),
+        Err(err) if is_commit_conflict(&err) => "conflicted".to_string(),
+        Err(err) => format!("failed {err}"),
     };
     std::fs::write(dir.join(format!("outcome-{tag}")), outcome).unwrap();
+}
+
+/// Whether a refresh lost its commit to a concurrent one, as opposed to
+/// failing for any other reason.
+fn is_commit_conflict(err: &crate::Error) -> bool {
+    let text = err.to_string();
+    text.contains("Retryable commit conflict") || text.contains("preempted by concurrent")
 }
 
 /// Two processes refreshing one view concurrently must leave the view
@@ -543,6 +551,8 @@ async fn concurrent_refreshes_hold_each_row_once() {
                     "--nocapture",
                 ])
                 .env("MV_RACE_DIR", dir.path())
+                .env("MV_RACE_SYNC", dir.path())
+                .env("MV_RACE_PEERS", "2")
                 .env("MV_RACE_TAG", tag)
                 .stdout(std::process::Stdio::null())
                 .stderr(std::process::Stdio::null())
@@ -563,14 +573,42 @@ async fn concurrent_refreshes_hold_each_row_once() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
     std::fs::write(dir.path().join("START"), b"1").unwrap();
-    for mut child in children {
-        let _ = child.wait();
+    for (tag, mut child) in tags.iter().zip(children) {
+        let status = loop {
+            match child.try_wait().unwrap() {
+                Some(status) => break status,
+                None if std::time::Instant::now() >= deadline => {
+                    child.kill().unwrap();
+                    panic!("child {tag} never finished");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(10)),
+            }
+        };
+        assert!(status.success(), "child {tag} exited {status}");
     }
+
+    // Both refreshes reached the commit boundary before either committed --
+    // the in-refresh barrier guarantees it -- so exactly one may win.
+    let outcomes: Vec<String> = tags
+        .iter()
+        .map(|tag| {
+            std::fs::read_to_string(dir.path().join(format!("outcome-{tag}")))
+                .unwrap_or_else(|_| panic!("child {tag} recorded no outcome"))
+        })
+        .collect();
     for tag in tags {
-        let outcome = std::fs::read_to_string(dir.path().join(format!("outcome-{tag}")))
-            .unwrap_or_else(|_| "MISSING (the child never finished)".to_string());
-        println!("child {tag}: {outcome}");
+        assert!(
+            dir.path().join(format!("planned-{tag}")).exists(),
+            "child {tag} never reached the commit boundary, so nothing was synchronized"
+        );
     }
+    let committed = outcomes.iter().filter(|o| o.contains("committed")).count();
+    let conflicted = outcomes.iter().filter(|o| o.contains("conflicted")).count();
+    assert_eq!(
+        (committed, conflicted),
+        (1, 1),
+        "exactly one refresh may win the generation both planned: {outcomes:?}"
+    );
 
     let expected = concurrency_oracle(&conn).await;
     let actual = concurrency_view_ids(&conn).await;
