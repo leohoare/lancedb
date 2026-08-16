@@ -405,6 +405,9 @@ async fn appends_and_rewrites(cur: &Dataset, from: u64, to: u64) -> Option<TxnDe
                 ..
             } => {
                 delta.updated_rows = true;
+                // merge_insert reaches here too, and its by-source arm deletes
+                // rows rather than changing them.
+                delta.deleted_rows = true;
                 delta.rewritten.extend(removed_fragment_ids.iter().copied());
                 delta.produced.extend(new_fragments.iter().map(|f| f.id));
                 delta
@@ -1267,6 +1270,26 @@ mod tests {
         let result = view.refresh().execute().await.unwrap();
         assert_eq!(result.mode, RefreshMode::Incremental);
         assert_eq!(read(view.table(), "twice").await, vec![6, 8]);
+    }
+
+    /// merge_insert commits an `Update`, and its by-source arm removes rows
+    /// rather than changing them, so the classifier must treat that
+    /// transaction form as a source of deletions.
+    #[tokio::test]
+    async fn test_merge_insert_by_source_delete_evicts_the_view_rows() {
+        let (conn, source) = db_with_source(vec![1, 2, 3]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        let batch = record_batch!(("x", Int32, vec![1, 3])).unwrap();
+        let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch.clone())], batch.schema());
+        let mut merge = source.merge_insert(&["x"]);
+        merge.when_not_matched_by_source_delete(None);
+        merge.execute(Box::new(reader)).await.unwrap();
+
+        let result = view.refresh().execute().await.unwrap();
+        assert_eq!(result.mode, RefreshMode::Incremental);
+        assert_eq!(read(view.table(), "twice").await, vec![2, 6]);
     }
 
     async fn compact(source: &Table) {
