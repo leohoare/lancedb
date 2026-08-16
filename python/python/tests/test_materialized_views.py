@@ -68,14 +68,15 @@ def test_incremental_refresh_after_append(tmp_path):
     assert view.refresh().mode == "no_op"
 
 
-def test_full_refresh_after_update(tmp_path):
+def test_incremental_refresh_after_update(tmp_path):
     db = make_db(tmp_path)
     view = db.create_materialized_view("copy", "people")
     view.refresh()
 
     db.open_table("people").update(where="name = 'kid'", values={"age": 8})
     result = view.refresh()
-    assert result.mode == "rebuild"
+    assert result.mode == "incremental"
+    assert result.rows_written == 1
     rows = view.table.search().to_list()
     assert sorted(row["age"] for row in rows) == [8, 36, 85]
 
