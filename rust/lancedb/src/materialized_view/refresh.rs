@@ -50,7 +50,7 @@ use lance::dataset::write::merge_insert::inserted_rows::{
     KeyExistenceFilter, KeyExistenceFilterBuilder, KeyValue,
 };
 use lance::dataset::{CommitBuilder, InsertBuilder, WriteDestination, WriteMode, WriteParams};
-use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID};
+use lance_core::{ROW_CREATED_AT_VERSION, ROW_ID, ROW_LAST_UPDATED_AT_VERSION};
 use lance_table::format::Fragment;
 use serde::{Deserialize, Serialize};
 
@@ -614,15 +614,16 @@ async fn incremental(
 ) -> Result<RefreshMaterializedViewResult> {
     let new_fragments = increment.appended;
     let watermark_version = watermark.unwrap_or(0);
-    // Rows the source dropped since the watermark. The view holds one row
-    // per source row, keyed by provenance, so evicting them is exact: no
-    // other view row is affected, which is why a delete no longer forces a
-    // rebuild.
-    let mut updated_ids: Vec<u64> = Vec::new();
     // Provenance ids whose view rows this refresh removes: rows the source
     // dropped, plus rows it changed, whose current values are recomputed and
-    // added back in the same commit.
-    let mut gone: Vec<u64> = Vec::new();
+    // added back in the same commit. The view holds one row per source row,
+    // keyed by provenance, so evicting them is exact: no other view row is
+    // affected, which is why a delete no longer forces a rebuild.
+    //
+    // Staged, not committed: the removals ride in the same commit as the rows
+    // that replace them, so a reader never sees the view without either.
+    let mut eviction = Eviction::new(view_ds, EVICTION_CHUNK);
+    let mut updated_rows = false;
     if (increment.evict_deleted || increment.replace_updated)
         && let Some(watermark) = watermark
     {
@@ -634,25 +635,19 @@ async fn incremental(
         if increment.evict_deleted {
             let mut stream = delta.get_deleted_row_ids().await?;
             while let Some(batch) = stream.try_next().await? {
-                gone.extend(row_ids_of(&batch)?);
+                eviction.push(&row_ids_of(&batch)?).await?;
             }
         }
         if increment.replace_updated {
             let mut stream = delta.get_updated_rows().await?;
             while let Some(batch) = stream.try_next().await? {
-                updated_ids.extend(row_ids_of(&batch)?);
+                let ids = row_ids_of(&batch)?;
+                updated_rows |= !ids.is_empty();
+                eviction.push(&ids).await?;
             }
-            gone.extend(updated_ids.iter().copied());
         }
     }
-
-    // Staged, not committed: the removals ride in the same commit as the rows
-    // that replace them, so a reader never sees the view without either.
-    let eviction = if gone.is_empty() {
-        None
-    } else {
-        Some(stage_eviction(view_ds, &gone).await?)
-    };
+    let eviction = eviction.finish().await?;
 
     // The cap counts rows already materialized, in first-materialized order.
     let remaining = match definition.limit {
@@ -669,8 +664,7 @@ async fn incremental(
         source_version,
         version: view_ds.version().version,
     };
-    let nothing_to_add =
-        (new_fragments.is_empty() && updated_ids.is_empty()) || remaining == Some(0);
+    let nothing_to_add = (new_fragments.is_empty() && !updated_rows) || remaining == Some(0);
     if nothing_to_add && eviction.is_none() {
         result.version =
             stamp_watermark(view_native, view_ds.clone(), source_version, source_ts).await?;
@@ -710,12 +704,12 @@ async fn incremental(
 
     // The updated rows' current values, computed the same way and appended
     // in the same commit as the new fragments' rows.
-    if !updated_ids.is_empty() {
+    if updated_rows {
         let recomputed = compute_stream(
             source_ds,
             definition,
             RowScope {
-                row_ids: Some(&updated_ids),
+                updated_between: Some((watermark_version, source_version)),
                 ..Default::default()
             },
             schema.clone(),
@@ -942,13 +936,14 @@ fn now_ms() -> u128 {
 /// [`SOURCE_ROW_ID_COLUMN`] by the scan's row id.
 /// Which source rows a compute pass reads.
 #[derive(Default)]
-struct RowScope<'a> {
+struct RowScope {
     /// Read only these fragments.
     fragments: Option<Vec<Fragment>>,
-    /// Read only these rows.
-    row_ids: Option<&'a [u64]>,
     /// Read only rows created after this version.
     created_after: Option<u64>,
+    /// Read only rows changed in place after the first version and no later
+    /// than the second.
+    updated_between: Option<(u64, u64)>,
     /// Stop after this many rows.
     limit: Option<u64>,
 }
@@ -956,14 +951,14 @@ struct RowScope<'a> {
 async fn compute_stream(
     source: &Dataset,
     definition: &MaterializedViewDefinition,
-    scope: RowScope<'_>,
+    scope: RowScope,
     schema: SchemaRef,
     rows_written: Arc<AtomicU64>,
 ) -> Result<SendableRecordBatchStream> {
     let RowScope {
         fragments,
-        row_ids,
         created_after,
+        updated_between,
         limit,
     } = scope;
     let mut scanner = source.scan();
@@ -974,13 +969,16 @@ async fn compute_stream(
     // Narrowing to specific rows keeps the definition's own filter, so a row
     // that no longer satisfies it simply does not come back -- which is how
     // an update that pushes a row out of the view removes it.
-    let ids_filter = row_ids.map(|ids| {
-        let list = ids
-            .iter()
-            .map(u64::to_string)
-            .collect::<Vec<_>>()
-            .join(", ");
-        format!("{ROW_ID} IN ({list})")
+    //
+    // The changed rows are named by the same predicate
+    // `DatasetDelta::get_updated_rows` uses, not by the ids it streams: an id
+    // list grows with the delta, this does not.
+    let updated_filter = updated_between.map(|(from, to)| {
+        format!(
+            "{ROW_CREATED_AT_VERSION} <= {from} \
+             AND {ROW_LAST_UPDATED_AT_VERSION} > {from} \
+             AND {ROW_LAST_UPDATED_AT_VERSION} <= {to}"
+        )
     });
     let created_filter =
         created_after.map(|version| format!("{ROW_CREATED_AT_VERSION} > {version}"));
@@ -989,7 +987,7 @@ async fn compute_stream(
         .clone()
         .map(|f| format!("({f})"))
         .into_iter()
-        .chain(ids_filter)
+        .chain(updated_filter)
         .chain(created_filter)
         .collect();
     if !clauses.is_empty() {
@@ -1093,6 +1091,97 @@ fn row_ids_of(batch: &RecordBatch) -> Result<Vec<u64>> {
             message: "row ids are not UInt64".into(),
         })?;
     Ok(ids.values().to_vec())
+}
+
+/// Provenance ids per staged eviction: the delete predicate carries one
+/// literal per id, so a whole delta at once is unbounded. Each chunk costs a
+/// pass over the view's provenance column, which is why it is not smaller.
+const EVICTION_CHUNK: usize = 64 * 1024;
+
+/// Accumulates the view's removals from bounded chunks of provenance ids into
+/// the one set of fragment changes the refresh publishes.
+struct Eviction {
+    /// The view as the chunks staged so far leave it. A chunk's delete has to
+    /// see the deletion vectors the earlier ones wrote, or it stages a
+    /// fragment that drops them.
+    snapshot: Dataset,
+    chunk: usize,
+    updated: HashMap<u64, Fragment>,
+    removed: Vec<u64>,
+    pending: Vec<u64>,
+    staged: bool,
+}
+
+impl Eviction {
+    fn new(view_ds: &Dataset, chunk: usize) -> Self {
+        Self {
+            snapshot: view_ds.clone(),
+            chunk,
+            updated: HashMap::new(),
+            removed: Vec::new(),
+            pending: Vec::new(),
+            staged: false,
+        }
+    }
+
+    async fn push(&mut self, ids: &[u64]) -> Result<()> {
+        self.pending.extend_from_slice(ids);
+        while self.pending.len() >= self.chunk {
+            let rest = self.pending.split_off(self.chunk);
+            let chunk = std::mem::replace(&mut self.pending, rest);
+            self.stage(&chunk).await?;
+        }
+        Ok(())
+    }
+
+    /// The staged fragment changes, or `None` where nothing was evicted.
+    async fn finish(mut self) -> Result<Option<(Vec<Fragment>, Vec<u64>)>> {
+        if !self.pending.is_empty() {
+            let chunk = std::mem::take(&mut self.pending);
+            self.stage(&chunk).await?;
+        }
+        if !self.staged {
+            return Ok(None);
+        }
+        let mut updated: Vec<Fragment> = self.updated.into_values().collect();
+        updated.sort_unstable_by_key(|f| f.id);
+        Ok(Some((updated, self.removed)))
+    }
+
+    async fn stage(&mut self, ids: &[u64]) -> Result<()> {
+        let (updated, removed) = stage_eviction(&self.snapshot, ids).await?;
+        self.snapshot = advance(&self.snapshot, &updated);
+        for fragment in updated {
+            self.updated.insert(fragment.id, fragment);
+        }
+        self.removed.extend(removed);
+        self.staged = true;
+        Ok(())
+    }
+}
+
+/// The view as staged removals leave it, without committing them.
+///
+/// Fragments are only replaced in place, so the dataset's fragment bitmap
+/// stays in step with the manifest. An emptied fragment has no replacement and
+/// is left alone: the delta names each provenance id once, so no later chunk
+/// can match its rows.
+fn advance(view_ds: &Dataset, updated: &[Fragment]) -> Dataset {
+    if updated.is_empty() {
+        return view_ds.clone();
+    }
+    let by_id: HashMap<u64, &Fragment> = updated.iter().map(|f| (f.id, f)).collect();
+    let fragments = view_ds
+        .manifest
+        .fragments
+        .iter()
+        .map(|f| by_id.get(&f.id).map_or_else(|| f.clone(), |u| (*u).clone()))
+        .collect();
+    let mut manifest = view_ds.manifest.as_ref().clone();
+    manifest.fragments = Arc::new(fragments);
+    let mut snapshot = view_ds.clone();
+    snapshot.manifest = Arc::new(manifest);
+    snapshot
 }
 
 /// The fragment changes that remove the view's rows for `ids`, staged rather
@@ -1549,6 +1638,53 @@ mod tests {
         refreshing.await.unwrap().unwrap();
         let after = conn.open_table("atomic_view").execute().await.unwrap();
         assert_eq!(read(&after, "twice").await, vec![22, 24, 26]);
+    }
+
+    async fn provenance_by_x(table: &Table) -> HashMap<i32, u64> {
+        let batches = table
+            .query()
+            .select(Select::columns(&["x", SOURCE_ROW_ID_COLUMN]))
+            .execute()
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let xs = batch["x"].as_any().downcast_ref::<Int32Array>().unwrap();
+                let ids = batch[SOURCE_ROW_ID_COLUMN].as_primitive::<UInt64Type>();
+                (0..batch.num_rows())
+                    .map(|i| (xs.value(i), ids.value(i)))
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
+
+    /// A delta past one chunk is staged in several passes over the same
+    /// fragments, so their deletion vectors have to accumulate rather than
+    /// replace each other.
+    #[tokio::test]
+    async fn test_a_chunked_eviction_removes_every_row_it_names() {
+        let (conn, _) = db_with_source(vec![1, 2, 3, 4, 5, 6]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        let native = view.table().as_native().unwrap();
+        let view_ds = native.dataset.get().await.unwrap().as_ref().clone();
+        let provenance = provenance_by_x(view.table()).await;
+
+        let mut eviction = Eviction::new(&view_ds, 2);
+        for x in [1, 2, 3, 4] {
+            eviction.push(&[provenance[&x]]).await.unwrap();
+        }
+        let staged = eviction.finish().await.unwrap();
+        assert!(staged.is_some(), "four ids over a chunk of two stage twice");
+        publish(&view_ds, staged, Vec::new(), None).await.unwrap();
+        native.dataset.reload().await.unwrap();
+
+        assert_eq!(read(view.table(), "x").await, vec![5, 6]);
     }
 
     /// A cap of zero is a view that holds nothing, not a view without a cap.
