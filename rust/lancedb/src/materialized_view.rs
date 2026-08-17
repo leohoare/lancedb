@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_schema::{DataType, Field as ArrowField, Schema as ArrowSchema, SchemaRef};
+use arrow_schema::{DataType, Field as ArrowField, FieldRef, Schema as ArrowSchema, SchemaRef};
 use datafusion_common::ScalarValue;
 use lance_core::ROW_ID;
 use lance_datafusion::planner::Planner;
@@ -31,8 +31,10 @@ use serde::{Deserialize, Serialize};
 use crate::connection::Connection;
 use crate::database::listing::OPT_NEW_TABLE_ENABLE_STABLE_ROW_IDS;
 use crate::database::{CreateTableRequest, Database, OpenTableRequest};
+use crate::embeddings::EmbeddingDefinition;
 use crate::table::Table;
 use crate::table::refresh::quote_identifier;
+use crate::table::{ColumnDefinition, ColumnKind};
 use crate::{Error, Result};
 
 /// Schema metadata key holding the view definition, as kind-tagged JSON.
@@ -64,8 +66,18 @@ const LANCE_FIELD_ID_KEY: &str = "lance:field_id";
 /// columns rather than storage, so a view carries it through.
 const EMBEDDING_FUNCTIONS_META_KEY: &str = "embedding_functions";
 
+/// Schema metadata key holding lancedb's own column definitions, one per
+/// field in schema order. It marks which columns an embedding function
+/// produces, which is what lets a query embed its own text.
+const COLUMN_DEFINITIONS_META_KEY: &str = "lancedb::column_definitions";
+
 /// Value of the definition's `kind` tag for the projected `select` form.
 pub const SELECT_KIND: &str = "select";
+
+/// Which view outputs each source column is projected to directly. A column
+/// may be projected more than once, so each carries every name the view gives
+/// it, in projection order.
+type Lineage = HashMap<String, Vec<String>>;
 
 /// One projected output column of a view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,11 +177,7 @@ pub(crate) fn plan(
     projections: &[(String, String)],
     filter: Option<&str>,
     limit: Option<u64>,
-) -> Result<(
-    MaterializedViewDefinition,
-    Vec<ArrowField>,
-    HashMap<String, String>,
-)> {
+) -> Result<(MaterializedViewDefinition, Vec<ArrowField>, Lineage)> {
     let projections: Vec<(String, String)> = if projections.is_empty() {
         source_schema
             .fields()
@@ -197,7 +205,7 @@ pub(crate) fn plan(
     let mut fields = Vec::with_capacity(projections.len());
     let mut inputs = Vec::new();
     let mut declared: Vec<&str> = Vec::with_capacity(projections.len());
-    let mut renames: HashMap<String, String> = HashMap::new();
+    let mut lineage: Lineage = HashMap::new();
 
     for (output, expression) in &projections {
         if declared.contains(&output.as_str()) {
@@ -267,7 +275,10 @@ pub(crate) fn plan(
         if let Some(path) = projected_path(&expr)
             && let [column] = path.as_slice()
         {
-            renames.insert(column.clone(), output.clone());
+            lineage
+                .entry(column.clone())
+                .or_default()
+                .push(output.clone());
         }
         fields.push(without_declarations(&field));
         inputs.extend(expr_inputs);
@@ -318,7 +329,7 @@ pub(crate) fn plan(
         limit,
         inputs,
     };
-    Ok((definition, fields, renames))
+    Ok((definition, fields, lineage))
 }
 
 /// Reject any function that is not immutable: a view definition has to
@@ -370,45 +381,105 @@ fn root(path: &str) -> &str {
 /// the rest are dropped. A configuration naming a column the view does not
 /// carry, or carries under another name, describes a table that does not
 /// exist.
-fn embedding_config_for_view(raw: &str, renames: &HashMap<String, String>) -> Option<String> {
+fn embedding_config_for_view(raw: &str, lineage: &Lineage) -> Option<String> {
     // Every representation the writers use: the Python bindings name the
     // destination `vector_column`, the Rust definition `dest_column`, and the
     // Node bindings spell both halves in camelCase.
     const SOURCE_KEYS: [&str; 2] = ["source_column", "sourceColumn"];
     const DEST_KEYS: [&str; 4] = ["vector_column", "dest_column", "vectorColumn", "destColumn"];
 
-    let mut entries: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
-    entries.retain_mut(|entry| {
-        let Some(object) = entry.as_object_mut() else {
-            return false;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(raw).ok()?;
+    let mut kept = Vec::new();
+    for entry in &entries {
+        let Some(object) = entry.as_object() else {
+            continue;
         };
-        let Some(source_key) = SOURCE_KEYS.iter().find(|key| object.contains_key(**key)) else {
-            return false;
+        let named = |keys: &[&str]| {
+            let key = keys.iter().find(|key| object.contains_key(**key))?;
+            let outputs = lineage.get(object.get(*key)?.as_str()?)?;
+            Some(((*key).to_string(), outputs))
         };
-        let Some(source) = object
-            .get(*source_key)
-            .and_then(|v| v.as_str())
-            .and_then(|name| renames.get(name))
-            .cloned()
+        let (Some((source_key, sources)), Some((dest_key, dests))) =
+            (named(&SOURCE_KEYS), named(&DEST_KEYS))
         else {
-            return false;
+            continue;
         };
-        let Some(dest_key) = DEST_KEYS.iter().find(|key| object.contains_key(**key)) else {
-            return false;
-        };
-        let Some(dest) = object
-            .get(*dest_key)
-            .and_then(|v| v.as_str())
-            .and_then(|name| renames.get(name))
-            .cloned()
-        else {
-            return false;
-        };
-        object.insert((*source_key).to_string(), serde_json::Value::String(source));
-        object.insert((*dest_key).to_string(), serde_json::Value::String(dest));
-        true
-    });
-    (!entries.is_empty()).then(|| serde_json::Value::Array(entries).to_string())
+        // A projection may give one source column several names, and every
+        // pairing of the two is a real relationship in the view.
+        for source in sources {
+            for dest in dests {
+                let mut object = object.clone();
+                object.insert(source_key.clone(), source.clone().into());
+                object.insert(dest_key.clone(), dest.clone().into());
+                kept.push(serde_json::Value::Object(object));
+            }
+        }
+    }
+    (!kept.is_empty()).then(|| serde_json::Value::Array(kept).to_string())
+}
+
+/// Lancedb's own column definitions rewritten for the view: positional, so
+/// one entry per view field. An output that projects an embedding column
+/// directly keeps its definition under the view's names; everything else,
+/// including the provenance column, is physical. `None` where the view keeps
+/// no embedding column, which is what an absent key already means.
+fn column_definitions_for_view(
+    raw: &str,
+    source_schema: &ArrowSchema,
+    view_fields: &[ArrowField],
+    lineage: &Lineage,
+) -> Option<String> {
+    let source_definitions: Vec<ColumnDefinition> = serde_json::from_str(raw).ok()?;
+    // The definition sits on the column the function writes, so the source
+    // schema's field name at that position is the embedding's destination.
+    let embeddings: HashMap<&str, &EmbeddingDefinition> = source_schema
+        .fields()
+        .iter()
+        .zip(&source_definitions)
+        .filter_map(|(field, definition)| match &definition.kind {
+            ColumnKind::Embedding(embedding) => Some((field.name().as_str(), embedding)),
+            ColumnKind::Physical => None,
+        })
+        .collect();
+    let sources: HashMap<&str, &str> = lineage
+        .iter()
+        .flat_map(|(source, outputs)| outputs.iter().map(move |o| (o.as_str(), source.as_str())))
+        .collect();
+
+    let mut kept = false;
+    let definitions: Vec<ColumnDefinition> = view_fields
+        .iter()
+        .map(|field| {
+            let kind = embedding_for_output(field.name(), &embeddings, &sources, lineage)
+                .map(|embedding| {
+                    kept = true;
+                    ColumnKind::Embedding(embedding)
+                })
+                .unwrap_or(ColumnKind::Physical);
+            ColumnDefinition { kind }
+        })
+        .collect();
+    kept.then(|| serde_json::to_string(&definitions).ok())?
+}
+
+/// The embedding `output` inherits, renamed to the view's columns. `None`
+/// unless the view projects both the function's input and its output
+/// directly: anything else advertises a column the view cannot recompute.
+fn embedding_for_output(
+    output: &str,
+    embeddings: &HashMap<&str, &EmbeddingDefinition>,
+    sources: &HashMap<&str, &str>,
+    lineage: &Lineage,
+) -> Option<EmbeddingDefinition> {
+    let embedding = embeddings.get(sources.get(output)?)?;
+    // The input may be projected several times; the first name the view gives
+    // it is the one this column is defined against.
+    let input = lineage.get(&embedding.source_column)?.first()?;
+    Some(EmbeddingDefinition {
+        source_column: input.clone(),
+        dest_column: Some(output.to_string()),
+        embedding_name: embedding.embedding_name.clone(),
+    })
 }
 
 /// The source field a projection reads directly, if it reads one: a bare
@@ -480,17 +551,26 @@ fn without_declarations(field: &ArrowField) -> ArrowField {
         .filter(|(key, _)| !is_declaration(key))
         .map(|(key, value)| (key.clone(), value.clone()))
         .collect();
+    let strip = |child: &FieldRef| Arc::new(without_declarations(child));
+    // Every Arrow variant that carries a field carries that field's metadata
+    // with it, so all of them are descended.
     let data_type = match field.data_type() {
-        DataType::Struct(children) => DataType::Struct(
-            children
+        DataType::Struct(children) => DataType::Struct(children.iter().map(strip).collect()),
+        DataType::List(child) => DataType::List(strip(child)),
+        DataType::ListView(child) => DataType::ListView(strip(child)),
+        DataType::LargeList(child) => DataType::LargeList(strip(child)),
+        DataType::LargeListView(child) => DataType::LargeListView(strip(child)),
+        DataType::Map(entries, sorted) => DataType::Map(strip(entries), *sorted),
+        DataType::FixedSizeList(child, len) => DataType::FixedSizeList(strip(child), *len),
+        DataType::Union(variants, mode) => DataType::Union(
+            variants
                 .iter()
-                .map(|c| Arc::new(without_declarations(c)))
+                .map(|(id, child)| (id, strip(child)))
                 .collect(),
+            *mode,
         ),
-        DataType::List(child) => DataType::List(Arc::new(without_declarations(child))),
-        DataType::LargeList(child) => DataType::LargeList(Arc::new(without_declarations(child))),
-        DataType::FixedSizeList(child, len) => {
-            DataType::FixedSizeList(Arc::new(without_declarations(child)), *len)
+        DataType::RunEndEncoded(run_ends, values) => {
+            DataType::RunEndEncoded(strip(run_ends), strip(values))
         }
         other => other.clone(),
     };
@@ -707,8 +787,13 @@ pub async fn prepare_declaration(
     }
     let source_schema = resolved.schema().await?;
     let source_metadata = source_schema.metadata().clone();
-    let (definition, mut fields, renames) =
-        plan(source_schema, resolved.name(), projections, filter, limit)?;
+    let (definition, mut fields, lineage) = plan(
+        source_schema.clone(),
+        resolved.name(),
+        projections,
+        filter,
+        limit,
+    )?;
     fields.push(ArrowField::new(
         SOURCE_ROW_ID_COLUMN,
         DataType::UInt64,
@@ -720,9 +805,14 @@ pub async fn prepare_declaration(
     // them would also declare a key over the view's always-nullable fields.
     let mut metadata: HashMap<String, String> = HashMap::new();
     if let Some(raw) = source_metadata.get(EMBEDDING_FUNCTIONS_META_KEY)
-        && let Some(rewritten) = embedding_config_for_view(raw, &renames)
+        && let Some(rewritten) = embedding_config_for_view(raw, &lineage)
     {
         metadata.insert(EMBEDDING_FUNCTIONS_META_KEY.to_string(), rewritten);
+    }
+    if let Some(raw) = source_metadata.get(COLUMN_DEFINITIONS_META_KEY)
+        && let Some(rewritten) = column_definitions_for_view(raw, &source_schema, &fields, &lineage)
+    {
+        metadata.insert(COLUMN_DEFINITIONS_META_KEY.to_string(), rewritten);
     }
     metadata.insert(
         DEFINITION_META_KEY.to_string(),
@@ -1527,6 +1617,54 @@ mod tests {
         );
     }
 
+    /// A map's entries are fields like any other, and a declaration on one
+    /// binds the view's writes just as hard as one on top.
+    #[tokio::test]
+    async fn test_map_declarations_are_stripped() {
+        let conn = connect("memory://").execute().await.unwrap();
+        let value =
+            ArrowField::new("value", DataType::Utf8, false).with_metadata(HashMap::from([(
+                "lance-schema:unenforced-clustering-key:position".to_string(),
+                "1".to_string(),
+            )]));
+        let entries = ArrowField::new(
+            "entries",
+            DataType::Struct(vec![ArrowField::new("key", DataType::Utf8, false), value].into()),
+            false,
+        );
+        let schema = Arc::new(ArrowSchema::new(vec![ArrowField::new(
+            "props",
+            DataType::Map(Arc::new(entries), false),
+            true,
+        )]));
+        conn.create_empty_table("src", schema)
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        let view = conn
+            .create_materialized_view("view", "src")
+            .execute()
+            .await
+            .unwrap();
+        let schema = view.table().schema().await.unwrap();
+        let DataType::Map(entries, _) = schema.field_with_name("props").unwrap().data_type() else {
+            panic!("props is not a map");
+        };
+        let DataType::Struct(children) = entries.data_type() else {
+            panic!("map entries are not a struct");
+        };
+        let value = children.iter().find(|c| c.name() == "value").unwrap();
+        assert!(
+            !value
+                .metadata()
+                .contains_key("lance-schema:unenforced-clustering-key:position"),
+            "a declaration survived inside a map: {:?}",
+            value.metadata()
+        );
+    }
+
     /// A computed column is declared by field metadata. Projecting one --
     /// as itself or under an alias -- must carry its description without its
     /// declaration, which the target table would reject as foreign.
@@ -1689,6 +1827,101 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(carried(&computed).await, None);
+
+        // One column projected twice is two columns in the view, and the
+        // configuration has to describe both rather than whichever came last.
+        let twice = conn
+            .create_materialized_view("twice", "src")
+            .select([("body", "text"), ("a", "vec"), ("b", "vec")])
+            .execute()
+            .await
+            .unwrap();
+        let carried = carried(&twice).await.expect("config dropped");
+        let entries: Vec<serde_json::Value> = serde_json::from_str(&carried).unwrap();
+        let mut vectors: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| e["vector_column"].as_str())
+            .collect();
+        vectors.sort_unstable();
+        assert_eq!(vectors, ["a", "b"], "{carried}");
+    }
+
+    /// The native Rust producer records embeddings as column definitions
+    /// rather than as `embedding_functions`, and a query embeds its own text
+    /// through them. They are positional, so the view's list covers every one
+    /// of its fields.
+    #[tokio::test]
+    async fn test_native_column_definitions_follow_the_projection() {
+        let conn = connect("memory://").execute().await.unwrap();
+        let rich = crate::table::TableDefinition::new(
+            Arc::new(ArrowSchema::new(vec![
+                ArrowField::new("text", DataType::Utf8, true),
+                ArrowField::new("vector", DataType::Float32, true),
+            ])),
+            vec![
+                ColumnDefinition {
+                    kind: ColumnKind::Physical,
+                },
+                ColumnDefinition {
+                    kind: ColumnKind::Embedding(EmbeddingDefinition::new(
+                        "text",
+                        "model",
+                        Some("vector"),
+                    )),
+                },
+            ],
+        )
+        .into_rich_schema();
+        conn.create_empty_table("src", rich)
+            .write_options(stable_row_ids())
+            .execute()
+            .await
+            .unwrap();
+
+        let view = conn
+            .create_materialized_view("view", "src")
+            .select([("body", "text"), ("embedding", "vector")])
+            .execute()
+            .await
+            .unwrap();
+        let schema = view.table().schema().await.unwrap();
+        let raw = schema
+            .metadata()
+            .get(COLUMN_DEFINITIONS_META_KEY)
+            .expect("the view dropped the native column definitions");
+        let definitions: Vec<ColumnDefinition> = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            definitions.len(),
+            schema.fields().len(),
+            "column definitions are positional"
+        );
+        let ColumnKind::Embedding(embedding) = &definitions[1].kind else {
+            panic!("the embedding column came back physical: {raw}");
+        };
+        assert_eq!(embedding.source_column, "body");
+        assert_eq!(embedding.dest_column.as_deref(), Some("embedding"));
+        assert_eq!(embedding.embedding_name, "model");
+        assert!(matches!(definitions[0].kind, ColumnKind::Physical));
+        assert!(matches!(definitions[2].kind, ColumnKind::Physical));
+
+        // Without the column the function reads, the view cannot recompute
+        // the embedding, so it carries no definition for it.
+        let partial = conn
+            .create_materialized_view("partial", "src")
+            .select([("embedding", "vector")])
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(
+            partial
+                .table()
+                .schema()
+                .await
+                .unwrap()
+                .metadata()
+                .get(COLUMN_DEFINITIONS_META_KEY),
+            None
+        );
     }
 
     /// A scan takes the cap as i64, so a larger one is refused where it is
