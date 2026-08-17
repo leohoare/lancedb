@@ -79,8 +79,9 @@ pub enum RefreshMode {
 pub struct RefreshMaterializedViewResult {
     /// How the view was brought up to date.
     pub mode: RefreshMode,
-    /// Rows written to the view: everything on a rebuild, the appended rows
-    /// on an incremental refresh.
+    /// Rows written to the view: everything on a rebuild, and on an
+    /// incremental refresh both the rows added and the rows recomputed in
+    /// place of ones the source changed.
     pub rows_written: u64,
     /// The source table version the view now reflects.
     pub source_version: u64,
@@ -316,6 +317,17 @@ async fn plan_increment(
         if folded {
             return None;
         }
+        // An update rewrites a whole fragment. If it touched one the watermark
+        // never saw, that fragment holds rows appended since -- new rows the
+        // update did not change, which the recompute does not cover and which
+        // this fragment's exclusion from the append set would drop.
+        if delta
+            .updated_in_place
+            .iter()
+            .any(|id| !old_ids.contains(id))
+        {
+            return None;
+        }
         // A cap stops rows being materialized once the view is full, and the
         // watermark then advances past them. Eviction can free room those
         // rows should fill, but they are no longer in any delta, so a capped
@@ -378,6 +390,8 @@ struct TxnDelta {
     /// The delta changed source rows in place, so the view holds rows to
     /// recompute.
     updated_rows: bool,
+    /// Fragments an update modified in place, as opposed to produced.
+    updated_in_place: HashSet<u64>,
 }
 
 /// Read the delta from the transaction log, `None` where it holds anything
@@ -395,6 +409,7 @@ async fn appends_and_rewrites(cur: &Dataset, from: u64, to: u64) -> Option<TxnDe
         produced: HashSet::new(),
         deleted_rows: false,
         updated_rows: false,
+        updated_in_place: HashSet::new(),
     };
     for version in (from + 1)..=to {
         let Ok(Some(txn)) = cur.read_transaction_by_version(version).await else {
@@ -429,6 +444,9 @@ async fn appends_and_rewrites(cur: &Dataset, from: u64, to: u64) -> Option<TxnDe
                 // creation version below, not by fragment identity.
                 delta
                     .produced
+                    .extend(updated_fragments.iter().map(|f| f.id));
+                delta
+                    .updated_in_place
                     .extend(updated_fragments.iter().map(|f| f.id));
                 let _ = new_fragments;
             }
@@ -1556,6 +1574,35 @@ mod tests {
         assert_eq!(
             view.refresh().execute().await.unwrap().mode,
             RefreshMode::NoOp
+        );
+    }
+
+    /// An update rewrites a whole fragment. When it lands on one appended
+    /// since the watermark, that fragment also holds rows the update never
+    /// touched -- rows the recompute does not cover and the append set no
+    /// longer reaches.
+    #[tokio::test]
+    async fn test_update_touching_a_new_fragment_keeps_its_untouched_rows() {
+        let (conn, source) = db_with_source(vec![1, 2]).await;
+        let view = doubled_view(&conn).await;
+        view.refresh().execute().await.unwrap();
+
+        // One fragment, appended after the watermark, holding both a row the
+        // update will change and a row it will not.
+        append(&source, vec![3, 40]).await;
+        source
+            .update()
+            .column("x", "99")
+            .only_if("x = 3")
+            .execute()
+            .await
+            .unwrap();
+
+        view.refresh().execute().await.unwrap();
+        assert_eq!(
+            read(view.table(), "twice").await,
+            vec![2, 4, 80, 198],
+            "a row appended into the updated fragment went missing"
         );
     }
 
